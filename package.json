@@ -1,0 +1,9 @@
+{
+  "name": "sallas-zeus",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Webhook local para gerenciamento de perfis NST Browser.",
+  "engines": { "node": ">=22.11.0" },
+  "scripts": { "start": "node server.mjs", "test": "node --test tests.mjs", "check": "node --check server.mjs && node --check core.mjs && node --check storage.mjs && node --check bot.mjs" }
+}

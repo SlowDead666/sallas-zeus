@@ -1,0 +1,4 @@
+# Credenciais e configurações locais nunca devem entrar no controle de versão.
+.local/
+node_modules/
+*.log
