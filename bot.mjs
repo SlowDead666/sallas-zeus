@@ -278,6 +278,23 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
     }
   }
 
+  /** Tecla especial trusted (Tab, Enter) — usada pra navegar entre campos
+   *  quando um overlay intercepta o clique (ex: painel lateral fixed). */
+  async function teclaEspecial(nome) {
+    const mapa = {
+      Tab:   { key: 'Tab',   code: 'Tab',   vk: 9  },
+      Enter: { key: 'Enter', code: 'Enter', vk: 13 },
+    };
+    const t = mapa[nome] ?? { key: nome, code: nome, vk: 0 };
+    await send('Input.dispatchKeyEvent', {
+      type: 'keyDown', key: t.key, code: t.code, windowsVirtualKeyCode: t.vk,
+    }, sessionId);
+    await delay(randomInt(30, 80));
+    await send('Input.dispatchKeyEvent', {
+      type: 'keyUp', key: t.key, code: t.code, windowsVirtualKeyCode: t.vk,
+    }, sessionId);
+  }
+
   /**
    * Digita texto com cadência ~N(media, desvio) por tecla + jitter.
    * backspaces>0 insere um erro de digitação seguido de correção
@@ -333,7 +350,7 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
   return {
     sessionId, ws, evaluate, esperarSeletor, esperarQualquerSeletor,
     centroDoSeletor,
-    clickAt, clicarSeletor, mouseMoverAte, digitar, tecla, send,
+    clickAt, clicarSeletor, mouseMoverAte, digitar, tecla, teclaEspecial, send,
     rolarPara, alturaRolavel, scrollAtual,
     get expirado() { return Date.now() > vencimento || fim.erro; },
     get erroConexao() { return fim.erro; },
@@ -451,6 +468,33 @@ async function etapaItem(cdp, etapa, seletores, log) {
 }
 
 /**
+ * Garante foco num campo por nome: tenta clique (humano), verifica o
+ * activeElement e, se um overlay interceptou o clique, navega por Tab
+ * (comportamento real de formulário). Último recurso: focus() via DOM.
+ */
+async function focarCampo(cdp, nome, log) {
+  const sel = `[name="${nome}"]`;
+  const q = JSON.stringify(sel);
+  const ativo = () => cdp.evaluate(
+    `document.activeElement === document.querySelector(${q})`
+  );
+
+  const clicou = await cdp.clicarSeletor(sel);
+  if (await ativo()) return true;
+  if (!clicou) { log('campo', `${nome} não achado`); return false; }
+  log('campo', `clique em ${nome} interceptado por overlay — navegando por Tab`);
+
+  for (let i = 0; i < 15; i++) {
+    await cdp.teclaEspecial('Tab');
+    await delay(randomInt(120, 350));
+    if (await ativo()) return true;
+  }
+  // Último recurso: focus() direto — garante preenchimento do campo.
+  await cdp.evaluate(`document.querySelector(${q})?.focus()`);
+  return ativo();
+}
+
+/**
  * Step 1 — dados pessoais: foca cada campo por clique e digita com
  * cadência da matriz (média/desvio por campo + jitter), backspaces
  * ocasionais e pausa final antes do submit.
@@ -464,8 +508,8 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
     const valor = comprador[nome];
     if (valor === undefined || valor === null || valor === '') continue;
     const stat = porCampo.get(nome) ?? porCampo.values().next().value;
-    const ok = await cdp.clicarSeletor(`[name="${nome}"]`);
-    if (!ok) { log('step1', `campo ${nome} não achado — pulando`); continue; }
+    const focado = await focarCampo(cdp, nome, log);
+    if (!focado) { log('step1', `campo ${nome} sem foco — pulando`); continue; }
     await delay(randomInt(200, 700));
     await cdp.digitar(valor, {
       media: jitter(stat?.inter_key_interval_ms_medio ?? 160),
