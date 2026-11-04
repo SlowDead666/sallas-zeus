@@ -371,7 +371,7 @@ async function passearMouse(cdp, eventos, { x0 = 200, x1 = 1000, y0 = 150, y1 = 
  * ETAPA home (/loja): dwell de navegação — scroll, mouse, hesitações,
  * hovers em cards de produto e clique no produto de saída.
  */
-async function etapaHome(cdp, etapa, seletores, log) {
+async function etapaHome(cdp, etapa, seletores, log, planoId = null) {
   log('home', 'início');
   await delay(jitter(etapa.tempo_ate_primeira_interacao_ms ?? 1500));
   await executarScroll(cdp, etapa.scroll);
@@ -396,7 +396,16 @@ async function etapaHome(cdp, etapa, seletores, log) {
   // O tempo já consumido é natural (ações acima); só ajusta o restante.
   await delay(randomInt(1500, 4000));
 
-  const clicado = await cdp.clicarSeletor(seletores.linkProduto);
+  // Se plano_id veio no webhook (id_assinatura da session_config), o clique
+  // mira o card daquele plano; senão, clica no primeiro produto da vitrine.
+  const alvoPlano = planoId
+    ? `a[href*="plano=${String(planoId).replace(/[^a-zA-Z0-9_-]/g, '')}"]`
+    : null;
+  let clicado = alvoPlano ? await cdp.clicarSeletor(alvoPlano) : false;
+  if (!clicado && alvoPlano) {
+    log('home', `plano ${planoId} não encontrado na vitrine; fallback para primeiro produto`);
+    clicado = await cdp.clicarSeletor(seletores.linkProduto);
+  }
   if (!clicado) throw new Error('Link de produto não encontrado na loja.');
   log('home', 'clique_produto → aguardando /produto');
   await cdp.esperarSeletor(seletores.paginaProduto, 10000);
@@ -554,7 +563,7 @@ export const SELETORES_PADRAO = {
  * @param {(etapa:string,msg:string)=>void} [args.log]
  * @returns {Promise<{ok:true, etapas:string[]}>}
  */
-export async function executeBot({ endpoint, matriz, comprador = {}, cartao = {}, seletores = {}, log = () => {} }) {
+export async function executeBot({ endpoint, matriz, comprador = {}, cartao = {}, seletores = {}, planoId = null, log = () => {} }) {
   if (!matriz?.jornada?.etapas?.length) throw new Error('matriz sem jornada.etapas — template ausente.');
   const sel = { ...SELETORES_PADRAO, ...seletores };
   const etapas = matriz.jornada.etapas;
@@ -567,7 +576,7 @@ export async function executeBot({ endpoint, matriz, comprador = {}, cartao = {}
     const item = porView.get('item');
     const checkout = porView.get('checkout');
 
-    if (home) { await etapaHome(cdp, home, sel, log); concluidas.push('home'); }
+    if (home) { await etapaHome(cdp, home, sel, log, planoId); concluidas.push('home'); }
     if (item) { await etapaItem(cdp, item, sel, log); concluidas.push('item'); }
 
     const steps = new Map((checkout?.steps ?? []).map(s => [s.step, s]));

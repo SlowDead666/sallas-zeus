@@ -164,6 +164,12 @@ export function normalizePayload(body, settings) {
       result[key] = body[key];
     }
   }
+  // plano_id opcional: id_assinatura da sessão — direciona o clique do bot
+  // ao card do plano correto dentro da vitrine da /loja.
+  if (body.plano_id !== undefined) {
+    if (typeof body.plano_id !== 'string' || !body.plano_id || body.plano_id.length > 120) throw new AppError(400, 'plano_id deve ser string até 120 caracteres.');
+    result.planoId = body.plano_id;
+  }
   if (tipo === 'retentativa') return result;
   if (body.platform !== undefined) {
     if (!['Windows', 'macOS', 'Linux'].includes(body.platform)) throw new AppError(400, "platform deve ser Windows, macOS ou Linux.");
@@ -321,7 +327,7 @@ export function createProcessor({ clientFactory = createNstClient, navigate = na
         if (input.bot) {
           // Bot usa o mesmo endpoint CDP da navegação; o perfil retentativa
           // preserva fingerprint — a sessão do bot herda tudo.
-          agendarBot(input.number, { endpoint: endpointRet, matriz: input.matriz, comprador: input.comprador ?? {}, cartao: input.cartao ?? {} }, runBot);
+          agendarBot(input.number, { endpoint: endpointRet, matriz: input.matriz, comprador: input.comprador ?? {}, cartao: input.cartao ?? {}, planoId: input.planoId ?? null }, runBot);
         }
         return { ok: true, number: input.number, profileId: id, action: 'reused', url: input.url, bot: input.bot ? 'executando' : undefined };
       }
@@ -367,7 +373,7 @@ export function createProcessor({ clientFactory = createNstClient, navigate = na
         }
         if (!endpoint) throw new AppError(502, 'NST não retornou o endereço CDP para o bot.');
         // A startupUrl já abriu /loja — o driver assume a partir daí.
-        agendarBot(input.number, { endpoint, matriz: input.matriz, comprador: input.comprador ?? {}, cartao: input.cartao ?? {} }, runBot);
+        agendarBot(input.number, { endpoint, matriz: input.matriz, comprador: input.comprador ?? {}, cartao: input.cartao ?? {}, planoId: input.planoId ?? null }, runBot);
       }
       return { ok: true, number: input.number, profileId: created.profileId, action: existing ? 'recreated' : 'created', url: input.url, warnings, bot: input.bot ? 'executando' : undefined };
     } catch (error) {
