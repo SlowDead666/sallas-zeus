@@ -282,11 +282,25 @@ export const botStatus = new Map();
 
 /** Dispara o bot em background sem bloquear a resposta do webhook; status fica em botStatus. */
 function agendarBot(number, args, runner) {
-  botStatus.set(number, { estado: 'executando', ts: new Date().toISOString() });
+  // Ring buffer dos últimos eventos — permite diagnosticar onde a
+  // jornada parou via GET /api/bot/status sem persistir nada em disco.
+  const eventos = [];
+  const log = (tag, msg) => {
+    eventos.push(`${new Date().toISOString().slice(11, 19)} [${tag}] ${msg}`);
+    if (eventos.length > 80) eventos.shift();
+    console.error(`[bot ${number}] ${tag}: ${msg}`);
+  };
+  args = { ...args, log };
+  const gravar = extra => botStatus.set(number, { ...extra, ts: new Date().toISOString(), eventos });
+  gravar({ estado: 'executando' });
   Promise.resolve()
     .then(() => runner(args))
-    .then(r => botStatus.set(number, { estado: 'concluido', ts: new Date().toISOString(), etapas: r?.etapas ?? [] }))
-    .catch(err => botStatus.set(number, { estado: 'erro', ts: new Date().toISOString(), erro: String(err?.message ?? err) }));
+    .then(r => gravar({ estado: 'concluido', etapas: r?.etapas ?? [] }))
+    .catch(err => {
+      // Stack completa no console — é o que permite diagnosticar a falha.
+      console.error(`[bot ${number}] erro:`, err?.stack ?? err);
+      gravar({ estado: 'erro', erro: String(err?.message ?? err) });
+    });
 }
 
 /** Serializa todo o ciclo por nome e rejeita sobrecarga; não repete automaticamente operações destrutivas. */

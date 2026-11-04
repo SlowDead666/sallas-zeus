@@ -82,7 +82,7 @@ function pick(arr, fallback) {
  * Uso de Target.attachToTarget(flatten) → comandos com sessionId
  * chegam no frame da página, não no browser.
  */
-export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS } = {}) {
+export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS, onEvent = null } = {}) {
   if (!endpoint || !/^wss?:\/\//.test(endpoint)) {
     throw new Error('Endpoint CDP inválido (webSocketDebuggerUrl esperado).');
   }
@@ -99,6 +99,9 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
       const { resolve, reject } = pendentes.get(data.id);
       pendentes.delete(data.id);
       data.error ? reject(new Error(`CDP ${data.error.message || 'erro'}`)) : resolve(data.result);
+    } else if (data.method && typeof onEvent === 'function') {
+      // Eventos CDP (exceções JS, console.error da página, erros de rede).
+      try { onEvent(data.method, data.params); } catch { /* log nunca derruba o bot */ }
     }
   });
   ws.addEventListener('close', () => {
@@ -114,13 +117,20 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
     ws.addEventListener('error', () => { clearTimeout(t); reject(new Error('WebSocket CDP falhou.')); }, { once: true });
   });
 
-  /** Envia comando CDP; sessionId opcional roteia para a aba. */
+  /** Envia comando CDP; sessionId opcional roteia para a aba.
+   *  Timeout de 30s evita travamento eterno se a resposta não chegar. */
   function send(method, params = {}, sessionId) {
     const id = nextId++;
     const msg = { id, method, params };
     if (sessionId) msg.sessionId = sessionId;
     return new Promise((resolve, reject) => {
-      pendentes.set(id, { resolve, reject });
+      const t = setTimeout(() => {
+        if (pendentes.delete(id)) reject(new Error(`Timeout CDP em ${method}.`));
+      }, 30000);
+      pendentes.set(id, {
+        resolve: r => { clearTimeout(t); resolve(r); },
+        reject: e => { clearTimeout(t); reject(e); },
+      });
       ws.send(JSON.stringify(msg));
     });
   }
@@ -152,11 +162,14 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
     return res?.result?.value;
   }
 
-  /** Centro do elemento via getBoundingClientRect; null se inexistente. */
+  /** Centro do elemento via getBoundingClientRect; null se inexistente.
+   *  scrollIntoView antes de medir — campos abaixo do fold gerariam
+   *  cliques fora do viewport (erro CDP / foco perdido). */
   async function centroDoSeletor(seletor) {
     return evaluate(`(() => {
       const el = document.querySelector(${JSON.stringify(seletor)});
       if (!el) return null;
+      el.scrollIntoView({ block: 'center', behavior: 'instant' });
       const r = el.getBoundingClientRect();
       if (!r.width && !r.height) return null;
       return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
@@ -246,15 +259,23 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
       }, sessionId);
       return;
     }
-    await send('Input.dispatchKeyEvent', {
-      type: 'rawKeyDown', key: char, text: undefined,
-    }, sessionId);
-    await send('Input.dispatchKeyEvent', {
-      type: 'char', key: char, text: char,
-    }, sessionId);
-    await send('Input.dispatchKeyEvent', {
-      type: 'keyUp', key: char,
-    }, sessionId);
+    /**
+     * keyDown com text — insere o caractere E gera o keydown real
+     * (cadência de tecla medida pelo fingerprint). rawKeyDown foi
+     * descartado: Chromium rejeita chars que não mapeiam tecla física
+     * (' ', '@', acentos) com Invalid parameters, matando o bot.
+     * Fallback Input.insertText garante inserção se algo ainda falhar.
+     */
+    try {
+      await send('Input.dispatchKeyEvent', {
+        type: 'keyDown', key: char, text: char,
+      }, sessionId);
+      await send('Input.dispatchKeyEvent', {
+        type: 'keyUp', key: char,
+      }, sessionId);
+    } catch {
+      await send('Input.insertText', { text: char }, sessionId);
+    }
   }
 
   /**
@@ -312,7 +333,7 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
   return {
     sessionId, ws, evaluate, esperarSeletor, esperarQualquerSeletor,
     centroDoSeletor,
-    clickAt, clicarSeletor, mouseMoverAte, digitar, tecla,
+    clickAt, clicarSeletor, mouseMoverAte, digitar, tecla, send,
     rolarPara, alturaRolavel, scrollAtual,
     get expirado() { return Date.now() > vencimento || fim.erro; },
     get erroConexao() { return fim.erro; },
@@ -451,6 +472,7 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
       desvio: jitter(stat?.inter_key_interval_ms_desvio ?? 50),
       backspaces: Math.random() < 0.35 ? jitter(stat?.backspaces ?? 0, { pct: 1 }) : 0,
     });
+    log('step1', `campo ${nome} digitado (${String(valor).length} chars)`);
     await delay(randomInt(300, 900));
   }
 
@@ -570,8 +592,26 @@ export async function executeBot({ endpoint, matriz, comprador = {}, cartao = {}
   const porView = new Map(etapas.map(e => [e.view, e]));
   const concluidas = [];
 
-  const cdp = await createCdpSession(endpoint);
+  // Eventos CDP → log: exceções JS da página, console.error e erros de
+  // rede (inclui os iframes PCI do MP) chegam ao console/status do Zeus.
+  const onEvent = (method, params) => {
+    if (method === 'Runtime.exceptionThrown') {
+      const d = params?.exceptionDetails ?? {};
+      const desc = d.exception?.description ?? d.text ?? 'exceção';
+      log('pagina', `JS: ${String(desc).slice(0, 220)}`);
+    } else if (method === 'Runtime.consoleAPICalled' && params?.type === 'error') {
+      const txt = (params.args ?? []).map(a => a.value ?? a.description ?? '').join(' ');
+      log('pagina', `console.error: ${String(txt).slice(0, 220)}`);
+    } else if (method === 'Log.entryAdded' && params?.entry?.level === 'error') {
+      const e = params.entry;
+      log('pagina', `rede: ${e.source} ${String(e.text ?? '').slice(0, 200)}`);
+    }
+  };
+
+  const cdp = await createCdpSession(endpoint, { onEvent });
   try {
+    // Liga captura de logs da página na sessão da aba.
+    try { await cdp.send('Log.enable', {}, cdp.sessionId); } catch { /* tolerante */ }
     const home = porView.get('home');
     const item = porView.get('item');
     const checkout = porView.get('checkout');
