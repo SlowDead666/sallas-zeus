@@ -406,6 +406,42 @@ async function passearMouse(cdp, eventos, { x0 = 200, x1 = 1000, y0 = 150, y1 = 
 }
 
 /**
+ * Clica num link e CONFIRMA a navegação pela mudança de location.href.
+ * Tenta 3 pontos horizontais do elemento pra escapar de overlays.
+ * BUG6 FIX: fracX passado via JSON.stringify — nunca interpolado direto
+ * no template literal (closure de for-of não preservava o valor certo).
+ */
+async function clicarComNav(cdp, seletor, { log, nome = 'link', esperarMs = 5000 } = {}) {
+  const q = JSON.stringify(seletor);
+  const hrefAntes = await cdp.evaluate('location.href').catch(() => null);
+
+  for (const fracX of [0.2, 0.5, 0.8]) {
+    // BUG6 FIX: fracX como argumento JSON — não interpolado no eval.
+    const frac = JSON.stringify(fracX);
+    const p = await cdp.evaluate(`(() => {
+      const el = document.querySelector(${q});
+      if (!el) return null;
+      el.scrollIntoView({ block: 'center', behavior: 'instant' });
+      const r = el.getBoundingClientRect();
+      if (!r.width && !r.height) return null;
+      const frac = ${frac};
+      return { x: Math.round(r.left + r.width * frac), y: Math.round(r.top + r.height / 2) };
+    })()`);
+    if (!p) return false;
+
+    await cdp.clickAt(p.x, p.y);
+    const t0 = Date.now();
+    while (Date.now() - t0 < esperarMs) {
+      await delay(250);
+      const href = await cdp.evaluate('location.href').catch(() => 'nav');
+      if (href !== hrefAntes) return true;
+    }
+    log('nav', `${nome}: clique @${Math.round(fracX * 100)}% sem efeito — tentando outro ponto`);
+  }
+  return false;
+}
+
+/**
  * ETAPA home (/loja): dwell de navegação — scroll, mouse, hesitações,
  * hovers em cards de produto e clique no produto de saída.
  */
@@ -418,12 +454,16 @@ async function etapaHome(cdp, etapa, seletores, log, planoId = null) {
   await pausasLeitura(cdp, etapa.hesitacoes);
 
   // Hovers em produtos: passa o mouse sobre cards sem clicar.
+  // BUG3 FIX: getBoundingClientRect retorna objeto DOM não serializável
+  // via returnByValue — extraímos só x/y como primitivos simples.
   const cards = await cdp.evaluate(
-    `[...document.querySelectorAll('${seletores.cardProduto}')].slice(0,4).map(el => {
-      const r = el.getBoundingClientRect(); return { x: r.left + r.width/2, y: r.top + r.height/2 };
+    `[...document.querySelectorAll(${JSON.stringify(seletores.cardProduto)})].slice(0,4).map(el => {
+      const r = el.getBoundingClientRect();
+      return [Math.round(r.left + r.width/2), Math.round(r.top + r.height/2)];
     })`
   );
-  for (const c of (Array.isArray(cards) ? cards : []).slice(0, etapa.ponteiro?.hovers_em_produtos ?? 3)) {
+  const cardsPontos = (Array.isArray(cards) ? cards : []).map(c => ({ x: c[0], y: c[1] }));
+  for (const c of cardsPontos.slice(0, etapa.ponteiro?.hovers_em_produtos ?? 3)) {
     await cdp.mouseMoverAte(c.x + randomInt(-30, 30), c.y + randomInt(-20, 20));
     await delay(randomInt(400, 1500));
   }
@@ -439,10 +479,12 @@ async function etapaHome(cdp, etapa, seletores, log, planoId = null) {
   const alvoPlano = planoId
     ? `a[href*="plano=${String(planoId).replace(/[^a-zA-Z0-9_-]/g, '')}"]`
     : null;
-  let clicado = alvoPlano ? await cdp.clicarSeletor(alvoPlano) : false;
-  if (!clicado && alvoPlano) {
-    log('home', `plano ${planoId} não encontrado na vitrine; fallback para primeiro produto`);
-    clicado = await cdp.clicarSeletor(seletores.linkProduto);
+  let clicado = alvoPlano
+    ? await clicarComNav(cdp, alvoPlano, { log, nome: `plano ${planoId}` })
+    : false;
+  if (!clicado) {
+    if (alvoPlano) log('home', `plano ${planoId} não navegou; fallback para primeiro produto`);
+    clicado = await clicarComNav(cdp, seletores.linkProduto, { log, nome: 'produto' });
   }
   if (!clicado) throw new Error('Link de produto não encontrado na loja.');
   log('home', 'clique_produto → aguardando /produto');
@@ -461,10 +503,15 @@ async function etapaItem(cdp, etapa, seletores, log) {
   await delay(Math.round(leitura / 2));
   await pausasLeitura(cdp, etapa.hesitacoes);
 
-  const clicado = await cdp.clicarSeletor(seletores.botaoContinuar);
+  // BUG2 FIX: botaoContinuar é Link > Button — clicarComNav detecta
+  // mudança de href; não esperar seletor de checkout na página atual.
+  const clicado = await clicarComNav(cdp, seletores.botaoContinuar, { log, nome: 'continuar', esperarMs: 6000 });
   if (!clicado) throw new Error('Botão continuar não encontrado no produto.');
-  log('item', 'clique_comprar → aguardando /checkout');
-  await cdp.esperarSeletor(seletores.step1Form, 10000);
+  log('item', 'clique_comprar → navegação iniciada');
+  // Aguarda o formulário do Step 1 aparecer na nova página.
+  const chegou = await cdp.esperarSeletor(seletores.step1Form, 15000);
+  if (!chegou) throw new Error('Checkout não carregou após clicar em continuar.');
+  log('item', 'checkout carregado');
 }
 
 /**
@@ -523,8 +570,9 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
   await delay(jitter(step.tempo_entre_ultimo_campo_e_submit_ms ?? 2500));
   const ok = await cdp.clicarSeletor(seletores.step1Submit);
   if (!ok) throw new Error('Botão do Step 1 não encontrado.');
-  log('step1', 'submit → aguardando iframes do Step 2');
-  await cdp.esperarSeletor(seletores.step2CardNumber, 12000);
+  log('step1', 'submit enviado');
+  // BUG1 FIX: não espera step2CardNumber aqui — o orquestrador decide
+  // qual step vem a seguir via esperarQualquerSeletor([step2, step3]).
 }
 
 /** Digita dentro de um iframe PCI focando via clique nas coordenadas. */
@@ -551,13 +599,16 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
   const media = jitter(cad.inter_key_interval_ms_medio ?? 190);
   const desvio = jitter(cad.inter_key_interval_ms_desvio ?? 50) || 45;
 
-  // Campos não-PCI primeiro (nossos inputs) — ordem humana de preenchimento.
-  await cdp.clicarSeletor(`[name="${seletores.campoHolder}"]`);
+  // BUG4 FIX: campos não-PCI usam focarCampo (verifica activeElement +
+  // fallback Tab) — mesmo padrão dos campos do Step 1.
+  const focadoHolder = await focarCampo(cdp, seletores.campoHolder, log);
+  if (!focadoHolder) throw new Error('Campo nome do titular não focou.');
   await delay(randomInt(200, 600));
   await cdp.digitar(cartao.nome_titular ?? `${comprador.first_name} ${comprador.last_name}`.toUpperCase(), { media, desvio });
   await delay(randomInt(300, 800));
 
-  await cdp.clicarSeletor(`[name="${seletores.campoCpfTitular}"]`);
+  const focadoCpf = await focarCampo(cdp, seletores.campoCpfTitular, log);
+  if (!focadoCpf) throw new Error('Campo CPF do titular não focou.');
   await delay(randomInt(200, 600));
   await cdp.digitar(cartao.cpf_titular ?? comprador.cpf, { media, desvio });
   await delay(randomInt(300, 800));
@@ -583,9 +634,16 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
 /** Step 3 — confirmação: só o CVV no iframe remontado + autorizar. */
 async function step3Confirmacao(cdp, step, seletores, cartao, log) {
   log('step3', 'confirmação CVV');
+  // Pausa humana entre receber o step3 e começar a digitar.
   await delay(jitter(step.tempo_entre_step2_e_step3_ms ?? 3000));
+  // Aguarda iframe do CVV estar presente antes de tentar digitar.
+  const iframeOk = await cdp.esperarSeletor('#mp-cvv2', 10000);
+  if (!iframeOk) throw new Error('Iframe CVV (mp-cvv2) não apareceu no Step 3.');
+  // BUG5 FIX: tempo_para_digitar_cvv_ms é o tempo DE digitação do CVV
+  // (usado como cadência), não um delay pós-digitação. Removido o delay
+  // errado — o intervalo pós-digitação/pré-submit já está em tempo_entre_step2_e_step3.
   await digitarEmIframe(cdp, 'mp-cvv2', cartao.cvv, { media: 190, desvio: 55 });
-  await delay(jitter(step.tempo_para_digitar_cvv_ms ?? 5000));
+  await delay(randomInt(800, 2000));
   const ok = await cdp.clicarSeletor(seletores.step3Submit);
   if (!ok) throw new Error('Botão de autorização não encontrado.');
   log('step3', 'submit — aguardando resposta do checkout');
