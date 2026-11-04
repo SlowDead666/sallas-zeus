@@ -419,25 +419,29 @@ async function passearMouse(cdp, eventos, { x0 = 200, x1 = 1000, y0 = 150, y1 = 
  * BUG6 FIX: fracX passado via JSON.stringify — nunca interpolado direto
  * no template literal (closure de for-of não preservava o valor certo).
  */
+/**
+ * Clica num link/botão e confirma que a URL mudou após o clique.
+ * Tenta 3 posições horizontais dentro do elemento para escapar de overlays.
+ * Coordenadas retornadas como array [x,y] — primitivos serializáveis pelo CDP.
+ */
 async function clicarComNav(cdp, seletor, { log, nome = 'link', esperarMs = 5000 } = {}) {
   const q = JSON.stringify(seletor);
   const hrefAntes = await cdp.evaluate('location.href').catch(() => null);
 
   for (const fracX of [0.2, 0.5, 0.8]) {
-    // BUG6 FIX: fracX como argumento JSON — não interpolado no eval.
     const frac = JSON.stringify(fracX);
-    const p = await cdp.evaluate(`(() => {
+    // Retorna [x, y] como array — objetos falham em returnByValue.
+    const coords = await cdp.evaluate(`(() => {
       const el = document.querySelector(${q});
       if (!el) return null;
-      el.scrollIntoView({ block: 'center', behavior: 'instant' });
+      el.scrollIntoView({ block: 'nearest', behavior: 'instant' });
       const r = el.getBoundingClientRect();
-      if (!r.width && !r.height) return null;
-      const frac = ${frac};
-      return { x: Math.round(r.left + r.width * frac), y: Math.round(r.top + r.height / 2) };
+      if (r.width === 0 && r.height === 0) return null;
+      return [Math.round(r.left + r.width * ${frac}), Math.round(r.top + r.height / 2)];
     })()`);
-    if (!p) return false;
+    if (!Array.isArray(coords)) return false;
 
-    await cdp.clickAt(p.x, p.y);
+    await cdp.clickAt(coords[0], coords[1]);
     const t0 = Date.now();
     while (Date.now() - t0 < esperarMs) {
       await delay(250);
@@ -495,8 +499,7 @@ async function etapaHome(cdp, etapa, seletores, log, planoId = null) {
     clicado = await clicarComNav(cdp, seletores.linkProduto, { log, nome: 'produto' });
   }
   if (!clicado) throw new Error('Link de produto não encontrado na loja.');
-  log('home', 'clique_produto → aguardando /produto');
-  await cdp.esperarSeletor(seletores.paginaProduto, 10000);
+  log('home', 'clique_produto → navegação confirmada');
 }
 
 /** ETAPA item (/produto): leitura de detalhes + clique em continuar. */

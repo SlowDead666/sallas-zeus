@@ -59,7 +59,7 @@ export function validateSettings(body, current) {
 }
 
 /** Inicializa servidor exclusivo em loopback. Configuração exige mesma origem para impedir CSRF/DNS rebinding. */
-export async function startServer({ port = 3187, publicWebhookHost = 'pineal-transplanetary-lorretta.ngrok-free.dev', store, process = createProcessor() } = {}) {
+export async function startServer({ port = 3187, publicWebhookHost = (globalThis.process.env.NGROK_HOST || 'pineal-transplanetary-lorretta.ngrok-free.dev'), store, process = createProcessor() } = {}) {
   store ??= await createStore(fileURLToPath(new URL('./.local/', import.meta.url)));
   const html = await readFile(new URL('./config.html', import.meta.url));
   let saving = false;
@@ -74,8 +74,13 @@ export async function startServer({ port = 3187, publicWebhookHost = 'pineal-tra
       const url = new URL(req.url, `http://127.0.0.1:${server.address().port}`);
       const forwarded = Object.keys(req.headers).some(name => name === 'forwarded' || name.startsWith('x-forwarded-'));
       const local = allowedHosts.includes(host) && !forwarded;
-      const publicWebhook = (host === publicWebhookHost || allowedHosts.includes(host)) && url.pathname === '/webhook';
-      if (!local && !publicWebhook) throw new AppError(403, 'Host não autorizado. Apenas /webhook pode ser acessado pelo túnel.');
+      // Normaliza o host removendo porta (ngrok HTTPS não envia porta mas pode variar).
+      const hostSemPorta = host.replace(/:\d+$/, '');
+      const publicWebhook = (hostSemPorta === publicWebhookHost || allowedHosts.includes(host)) && url.pathname === '/webhook';
+      if (!local && !publicWebhook) {
+        globalThis.process.stderr.write(`[zeus] 403 host="${host}" hostSemPorta="${hostSemPorta}" publicWebhookHost="${publicWebhookHost}" path="${url.pathname}" forwarded=${forwarded}\n`);
+        throw new AppError(403, 'Host não autorizado. Apenas /webhook pode ser acessado pelo túnel.');
+      }
       const isConfig = url.pathname === '/config' || url.pathname.startsWith('/api/config') || url.pathname === '/config.js';
       if (isConfig && (req.headers['sec-fetch-site'] === 'cross-site' || (req.headers.origin && req.headers.origin !== `http://${host}`))) throw new AppError(403, 'Configuração acessível somente pela mesma origem local.');
       if (req.method === 'GET' && url.pathname === '/') { res.writeHead(302, { location: '/config' }); return res.end(); }
