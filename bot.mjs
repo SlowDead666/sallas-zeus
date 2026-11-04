@@ -162,18 +162,26 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
     return res?.result?.value;
   }
 
-  /** Centro do elemento via getBoundingClientRect; null se inexistente.
-   *  scrollIntoView antes de medir — campos abaixo do fold gerariam
-   *  cliques fora do viewport (erro CDP / foco perdido). */
+  /**
+   * Centro do elemento em coordenadas de viewport.
+   * Retorna array [x, y] (primitivos) — objetos falham em returnByValue
+   * dependendo do contexto CDP. scrollIntoView síncrono (behavior:instant)
+   * garante que o elemento está visível antes de medir.
+   */
   async function centroDoSeletor(seletor) {
-    return evaluate(`(() => {
+    const coords = await evaluate(`(() => {
       const el = document.querySelector(${JSON.stringify(seletor)});
       if (!el) return null;
-      el.scrollIntoView({ block: 'center', behavior: 'instant' });
+      el.scrollIntoView({ block: 'nearest', behavior: 'instant' });
       const r = el.getBoundingClientRect();
-      if (!r.width && !r.height) return null;
-      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      const x = Math.round(r.left + r.width / 2);
+      const y = Math.round(r.top + r.height / 2);
+      if (x <= 0 && y <= 0) return null;
+      if (r.width === 0 && r.height === 0) return null;
+      return [x, y];
     })()`);
+    if (!Array.isArray(coords)) return null;
+    return { x: coords[0], y: coords[1] };
   }
 
   /** Aguarda elemento existir no DOM com polling leve. */
@@ -515,30 +523,34 @@ async function etapaItem(cdp, etapa, seletores, log) {
 }
 
 /**
- * Garante foco num campo por nome: tenta clique (humano), verifica o
- * activeElement e, se um overlay interceptou o clique, navega por Tab
- * (comportamento real de formulário). Último recurso: focus() via DOM.
+ * Foca um campo pelo clique — simples e direto.
+ * Tab só entra quando o clique realmente falha (elemento não existe
+ * ou coordenadas fora do viewport). Não queremos Tab como padrão.
  */
 async function focarCampo(cdp, nome, log) {
   const sel = `[name="${nome}"]`;
   const q = JSON.stringify(sel);
-  const ativo = () => cdp.evaluate(
+
+  // Primeira tentativa: clique normal (humano).
+  const clicou = await cdp.clicarSeletor(sel);
+  if (!clicou) {
+    log('campo', `${nome} não encontrado no DOM`);
+    return false;
+  }
+
+  // Verifica foco após uma pausa curta (React pode ter delay de setState).
+  await delay(80);
+  const focado = await cdp.evaluate(
     `document.activeElement === document.querySelector(${q})`
   );
+  if (focado) return true;
 
-  const clicou = await cdp.clicarSeletor(sel);
-  if (await ativo()) return true;
-  if (!clicou) { log('campo', `${nome} não achado`); return false; }
-  log('campo', `clique em ${nome} interceptado por overlay — navegando por Tab`);
-
-  for (let i = 0; i < 15; i++) {
-    await cdp.teclaEspecial('Tab');
-    await delay(randomInt(120, 350));
-    if (await ativo()) return true;
-  }
-  // Último recurso: focus() direto — garante preenchimento do campo.
+  // Clique falhou silenciosamente (overlay, coordenada errada): focus() DOM.
+  // Mais discreto que Tab — não gera sequência de keydowns visível.
+  log('campo', `${nome}: clique sem foco — usando focus() DOM`);
   await cdp.evaluate(`document.querySelector(${q})?.focus()`);
-  return ativo();
+  await delay(60);
+  return cdp.evaluate(`document.activeElement === document.querySelector(${q})`);
 }
 
 /**
@@ -575,74 +587,198 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
   // qual step vem a seguir via esperarQualquerSeletor([step2, step3]).
 }
 
-/** Digita dentro de um iframe PCI focando via clique nas coordenadas. */
-async function digitarEmIframe(cdp, containerId, texto, { media, desvio, pausasBloco } = {}) {
+/**
+ * Aguarda o iframe do Mercado Pago aparecer dentro do container e
+ * retorna a sessionId CDP para digitar diretamente nele.
+ *
+ * Estratégia de identificação do iframe correto (3 iframes na página):
+ *   1. Lê o `src` do <iframe> filho de #containerId via evaluate
+ *   2. Cruza com Target.getTargets pelo campo `url` do target
+ *   3. Anexa sessão CDP ao target correto — teclas chegam nesse campo
+ *
+ * @param {object} cdp     - sessão CDP da página
+ * @param {string} containerId - id do div container (sem #)
+ * @param {Function} log   - função de log
+ * @returns {Promise<string|null>} sessionId do iframe, ou null
+ */
+async function resolverSessaoIframe(cdp, containerId, log) {
+  const q = JSON.stringify(`#${containerId} iframe`);
+  for (let tentativa = 0; tentativa < 30; tentativa++) {
+    // Lê o src do iframe dentro do container específico.
+    const iframeSrc = await cdp.evaluate(
+      `document.querySelector(${q})?.src ?? null`
+    );
+    if (iframeSrc) {
+      // Cruza com os targets ativos pelo url.
+      const { targetInfos } = await cdp.send('Target.getTargets');
+      const alvo = (targetInfos ?? []).find(t =>
+        t.type === 'iframe' && t.url && iframeSrc.startsWith(t.url.split('?')[0])
+      ) ?? (targetInfos ?? []).find(t =>
+        // fallback: qualquer iframe do SDK MP ainda não casado
+        t.type === 'iframe' &&
+        (t.url?.includes('mercadopago') || t.url?.includes('mlstatic'))
+      );
+      if (alvo) {
+        try {
+          const { sessionId: sid } = await cdp.send('Target.attachToTarget', {
+            targetId: alvo.targetId, flatten: true,
+          });
+          await cdp.send('Runtime.enable', {}, sid);
+          log('iframe', `${containerId}: sessão CDP anexada (${alvo.targetId.slice(0, 8)}…)`);
+          return sid;
+        } catch (e) {
+          log('iframe', `${containerId}: attach falhou — ${e.message}`);
+        }
+      }
+    }
+    await delay(400);
+  }
+  log('iframe', `${containerId}: iframe não localizado em 12s`);
+  return null;
+}
+
+/**
+ * Digita texto dentro de um iframe PCI do Mercado Pago.
+ *
+ * O MP monta um <iframe> cross-origin dentro do div #containerId.
+ * Teclas enviadas via sessionId da página não chegam ao iframe —
+ * o bot anexa uma sessão CDP diretamente ao target do iframe correto
+ * (identificado pelo src do elemento, não por busca genérica).
+ *
+ * Fallback: Input.insertText na sessão da página quando o target
+ * não é localizável (renderer unificado / perfil local sem isolamento).
+ *
+ * @param {object} cdp         - sessão CDP da página
+ * @param {string} containerId - id do div container sem # (ex: 'mp-card-number')
+ * @param {string} texto       - valor a digitar (só dígitos são usados para PCI)
+ * @param {object} [opts]      - media, desvio, pausasBloco
+ * @param {Function} log       - função de log
+ */
+async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 50, pausasBloco = false } = {}, log = () => {}) {
+  // Clique no container → foca o iframe visualmente (mouse trusted).
   const ok = await cdp.clicarSeletor(`#${containerId}`);
-  if (!ok) throw new Error(`Container ${containerId} não encontrado.`);
-  await delay(randomInt(250, 700));
+  if (!ok) throw new Error(`Container #${containerId} não encontrado no DOM.`);
+  await delay(randomInt(300, 700));
+
+  // Anexa sessão CDP ao iframe correto.
+  const iframeSessionId = await resolverSessaoIframe(cdp, containerId, log);
+
   const chars = [...String(texto).replace(/\D/g, '')];
-  for (let i = 0; i < chars.length; i++) {
-    await cdp.tecla(chars[i]);
-    await delay(intervaloTecla(media, desvio));
-    // Pausa humana entre blocos de 4 dígitos (olhar o cartão físico).
-    if (pausasBloco && (i + 1) % 4 === 0 && i + 1 < chars.length) {
-      await delay(randomInt(400, 1400));
+  if (!chars.length) return;
+
+  if (iframeSessionId) {
+    // Caminho principal: teclas no contexto isolado do iframe.
+    for (let i = 0; i < chars.length; i++) {
+      await cdp.send('Input.dispatchKeyEvent', {
+        type: 'keyDown', key: chars[i], text: chars[i],
+      }, iframeSessionId);
+      await cdp.send('Input.dispatchKeyEvent', {
+        type: 'keyUp', key: chars[i],
+      }, iframeSessionId);
+      await delay(intervaloTecla(media, desvio));
+      if (pausasBloco && (i + 1) % 4 === 0 && i + 1 < chars.length) {
+        await delay(randomInt(400, 1400));
+      }
+    }
+  } else {
+    // Fallback: insertText na sessão da página.
+    // Funciona quando o renderer não isola o iframe (NST single-process).
+    log('iframe', `${containerId}: fallback insertText`);
+    for (let i = 0; i < chars.length; i++) {
+      await cdp.send('Input.insertText', { text: chars[i] });
+      await delay(intervaloTecla(media, desvio));
+      if (pausasBloco && (i + 1) % 4 === 0 && i + 1 < chars.length) {
+        await delay(randomInt(400, 1400));
+      }
     }
   }
 }
 
-/** Step 2 — cartão: nome do titular (input nosso) + 3 iframes PCI. */
+/**
+ * Step 2 — cartão novo.
+ * Ordem visual real do DOM (CheckoutWizard):
+ *   1. #mp-card-number    (iframe PCI — número)
+ *   2. card_holder        (input nosso — nome no cartão)
+ *   3. #mp-expiration-date (iframe PCI — validade)
+ *   4. #mp-security-code  (iframe PCI — CVV)
+ *   5. cpf_titular        (input nosso — CPF do titular)
+ *   6. botão submit       (desabilitado até SDK pronto)
+ */
 async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
-  log('step2', 'cartão');
+  log('step2', 'cartão — aguardando SDK MP estar pronto');
   const cad = step.cadencia_numero_cartao ?? {};
   const cadCvv = step.cadencia_validade_cvv ?? {};
   const media = jitter(cad.inter_key_interval_ms_medio ?? 190);
   const desvio = jitter(cad.inter_key_interval_ms_desvio ?? 50) || 45;
 
-  // BUG4 FIX: campos não-PCI usam focarCampo (verifica activeElement +
-  // fallback Tab) — mesmo padrão dos campos do Step 1.
+  // Aguarda botão submit habilitado — indica SDK pronto.
+  // disabled={loading || !sdkPronto} no CheckoutWizard.
+  for (let i = 0; i < 40; i++) {
+    const habilitado = await cdp.evaluate(
+      `(() => { const b = document.querySelector('form button[type="submit"]'); return b && !b.disabled; })()`
+    );
+    if (habilitado) break;
+    await delay(500);
+    if (i === 39) log('step2', 'SDK não habilitou botão em 20s — tentando mesmo assim');
+  }
+
+  // 1. Número do cartão (iframe PCI).
+  await digitarEmIframe(cdp, 'mp-card-number', cartao.numero, {
+    media, desvio, pausasBloco: Boolean(cad.pausas_entre_blocos_4_digitos),
+  }, log);
+  await delay(randomInt(500, 1200));
+
+  // 2. Nome no cartão (input nosso — ordem visual).
   const focadoHolder = await focarCampo(cdp, seletores.campoHolder, log);
   if (!focadoHolder) throw new Error('Campo nome do titular não focou.');
   await delay(randomInt(200, 600));
-  await cdp.digitar(cartao.nome_titular ?? `${comprador.first_name} ${comprador.last_name}`.toUpperCase(), { media, desvio });
-  await delay(randomInt(300, 800));
+  await cdp.digitar(
+    cartao.nome_titular ?? `${comprador.first_name} ${comprador.last_name}`.toUpperCase(),
+    { media, desvio }
+  );
+  await delay(randomInt(400, 900));
 
+  // 3. Validade (iframe PCI).
+  await digitarEmIframe(cdp, 'mp-expiration-date', cartao.validade, { media, desvio }, log);
+  await delay(randomInt(400, 1000));
+
+  // 4. CVV (iframe PCI).
+  await digitarEmIframe(cdp, 'mp-security-code', cartao.cvv, {
+    media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio,
+  }, log);
+  await delay(randomInt(500, 1200));
+
+  // 5. CPF do titular (input nosso — último campo visual).
   const focadoCpf = await focarCampo(cdp, seletores.campoCpfTitular, log);
   if (!focadoCpf) throw new Error('Campo CPF do titular não focou.');
   await delay(randomInt(200, 600));
-  await cdp.digitar(cartao.cpf_titular ?? comprador.cpf, { media, desvio });
-  await delay(randomInt(300, 800));
+  await cdp.digitar(String(cartao.cpf_titular ?? comprador.cpf ?? '').replace(/\D/g, ''), { media, desvio });
+  await delay(randomInt(400, 900));
 
-  // Iframes PCI na ordem visual: número → validade → CVV.
-  await digitarEmIframe(cdp, 'mp-card-number', cartao.numero, {
-    media, desvio, pausasBloco: Boolean(cad.pausas_entre_blocos_4_digitos),
-  });
-  await delay(randomInt(400, 1200));
-  await digitarEmIframe(cdp, 'mp-expiration-date', cartao.validade, { media, desvio });
-  await delay(randomInt(400, 1200));
-  await digitarEmIframe(cdp, 'mp-security-code', cartao.cvv, {
-    media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio,
-  });
-
-  await delay(jitter(step.tempo_entre_montagem_iframe_e_submit_ms ?? 5000));
+  // 6. Submit — pausa humana de revisão antes de clicar.
+  await delay(jitter(step.tempo_entre_montagem_iframe_e_submit_ms ?? 4000));
   const ok = await cdp.clicarSeletor(seletores.step2Submit);
   if (!ok) throw new Error('Botão do Step 2 não encontrado.');
-  log('step2', 'submit → aguardando Step 3 (CVV confirmação)');
-  await cdp.esperarSeletor('#mp-cvv2', 15000);
+  log('step2', 'submit → aguardando Step 3');
+  // Aguarda container do CVV do step3 aparecer.
+  await cdp.esperarSeletor('#mp-cvv2', 20000);
 }
 
-/** Step 3 — confirmação: só o CVV no iframe remontado + autorizar. */
+/**
+ * Step 3 — confirmação do CVV.
+ *
+ * Chamado em dois fluxos:
+ *   a) após step2Cartao  → #mp-cvv2 já confirmado no final do step2
+ *   b) cartão já salvo   → esperarQualquerSeletor já confirmou #mp-cvv2
+ *
+ * Em ambos os casos o container está presente quando esta função é chamada.
+ * Aguarda um breve tempo humano, digita o CVV e submete.
+ */
 async function step3Confirmacao(cdp, step, seletores, cartao, log) {
   log('step3', 'confirmação CVV');
-  // Pausa humana entre receber o step3 e começar a digitar.
-  await delay(jitter(step.tempo_entre_step2_e_step3_ms ?? 3000));
-  // Aguarda iframe do CVV estar presente antes de tentar digitar.
-  const iframeOk = await cdp.esperarSeletor('#mp-cvv2', 10000);
-  if (!iframeOk) throw new Error('Iframe CVV (mp-cvv2) não apareceu no Step 3.');
-  // BUG5 FIX: tempo_para_digitar_cvv_ms é o tempo DE digitação do CVV
-  // (usado como cadência), não um delay pós-digitação. Removido o delay
-  // errado — o intervalo pós-digitação/pré-submit já está em tempo_entre_step2_e_step3.
-  await digitarEmIframe(cdp, 'mp-cvv2', cartao.cvv, { media: 190, desvio: 55 });
+  // Pausa humana de quem leu a tela antes de digitar o CVV.
+  await delay(jitter(step.tempo_entre_step2_e_step3_ms ?? 2000));
+  await digitarEmIframe(cdp, 'mp-cvv2', cartao.cvv, { media: 190, desvio: 55 }, log);
   await delay(randomInt(800, 2000));
   const ok = await cdp.clicarSeletor(seletores.step3Submit);
   if (!ok) throw new Error('Botão de autorização não encontrado.');
@@ -734,7 +870,14 @@ export async function executeBot({ endpoint, matriz, comprador = {}, cartao = {}
       );
 
       if (proximo === sel.step3Cvv) {
-        log('fluxo', 'variação: cartão já salvo — Step 2 pulado pelo wizard');
+        // Cartão já salvo — wizard pulou Step 2.
+        // Aguarda o iframe MP estar montado dentro de #mp-cvv2 (não só o div).
+        log('fluxo', 'variação: cartão já salvo — aguardando iframe CVV montar');
+        for (let i = 0; i < 20; i++) {
+          const temIframe = await cdp.evaluate(`!!document.querySelector('#mp-cvv2 iframe')`);
+          if (temIframe) break;
+          await delay(400);
+        }
       } else if (proximo === sel.step2CardNumber) {
         if (steps.get(2)) await step2Cartao(cdp, steps.get(2), sel, comprador, cartao, log);
         else log('fluxo', 'Step 2 no DOM mas ausente na matriz — pulando execução');
