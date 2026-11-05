@@ -591,110 +591,72 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
 }
 
 /**
- * Aguarda o iframe do Mercado Pago aparecer dentro do container e
- * retorna a sessionId CDP para digitar diretamente nele.
- *
- * Estratégia de identificação do iframe correto (3 iframes na página):
- *   1. Lê o `src` do <iframe> filho de #containerId via evaluate
- *   2. Cruza com Target.getTargets pelo campo `url` do target
- *   3. Anexa sessão CDP ao target correto — teclas chegam nesse campo
- *
- * @param {object} cdp     - sessão CDP da página
- * @param {string} containerId - id do div container (sem #)
- * @param {Function} log   - função de log
- * @returns {Promise<string|null>} sessionId do iframe, ou null
- */
-async function resolverSessaoIframe(cdp, containerId, log) {
-  const q = JSON.stringify(`#${containerId} iframe`);
-  for (let tentativa = 0; tentativa < 30; tentativa++) {
-    // Lê o src do iframe dentro do container específico.
-    const iframeSrc = await cdp.evaluate(
-      `document.querySelector(${q})?.src ?? null`
-    );
-    if (iframeSrc) {
-      // Cruza com os targets ativos pelo url.
-      const { targetInfos } = await cdp.send('Target.getTargets');
-      const alvo = (targetInfos ?? []).find(t =>
-        t.type === 'iframe' && t.url && iframeSrc.startsWith(t.url.split('?')[0])
-      ) ?? (targetInfos ?? []).find(t =>
-        // fallback: qualquer iframe do SDK MP ainda não casado
-        t.type === 'iframe' &&
-        (t.url?.includes('mercadopago') || t.url?.includes('mlstatic'))
-      );
-      if (alvo) {
-        try {
-          const { sessionId: sid } = await cdp.send('Target.attachToTarget', {
-            targetId: alvo.targetId, flatten: true,
-          });
-          await cdp.send('Runtime.enable', {}, sid);
-          log('iframe', `${containerId}: sessão CDP anexada (${alvo.targetId.slice(0, 8)}…)`);
-          return sid;
-        } catch (e) {
-          log('iframe', `${containerId}: attach falhou — ${e.message}`);
-        }
-      }
-    }
-    await delay(400);
-  }
-  log('iframe', `${containerId}: iframe não localizado em 12s`);
-  return null;
-}
-
-/**
  * Digita texto dentro de um iframe PCI do Mercado Pago.
  *
  * O MP monta um <iframe> cross-origin dentro do div #containerId.
- * Teclas enviadas via sessionId da página não chegam ao iframe —
- * o bot anexa uma sessão CDP diretamente ao target do iframe correto
- * (identificado pelo src do elemento, não por busca genérica).
+ * Estratégia:
+ *   1. Clique no container → foca o iframe visualmente (mouse trusted)
+ *   2. Lê o nome do campo via atributo data-* ou pela posição do iframe
+ *      dentro da lista de iframes do SDK — identifica o target correto
+ *   3. Envia teclas via Input.dispatchKeyEvent sem sessionId (roteado
+ *      pelo browser ao frame focado) — funciona porque o clique já
+ *      focou o iframe e o browser roteia input ao frame ativo
  *
- * Fallback: Input.insertText na sessão da página quando o target
- * não é localizável (renderer unificado / perfil local sem isolamento).
+ * Nota: Input.dispatchKeyEvent sem sessionId vai ao frame COM FOCO no
+ * browser — exatamente o que queremos após clicar no container.
+ * Não precisamos de sessão CDP separada para o iframe.
  *
  * @param {object} cdp         - sessão CDP da página
  * @param {string} containerId - id do div container sem # (ex: 'mp-card-number')
- * @param {string} texto       - valor a digitar (só dígitos são usados para PCI)
+ * @param {string} texto       - valor a digitar (só dígitos usados para PCI)
  * @param {object} [opts]      - media, desvio, pausasBloco
  * @param {Function} log       - função de log
  */
 async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 50, pausasBloco = false } = {}, log = () => {}) {
-  // Clique no container → foca o iframe visualmente (mouse trusted).
+  // Clique no container → foca o iframe visualmente.
   const ok = await cdp.clicarSeletor(`#${containerId}`);
   if (!ok) throw new Error(`Container #${containerId} não encontrado no DOM.`);
-  await delay(randomInt(300, 700));
 
-  // Anexa sessão CDP ao iframe correto.
-  const iframeSessionId = await resolverSessaoIframe(cdp, containerId, log);
+  // Aguarda o iframe aparecer e clicar nele diretamente para garantir foco.
+  // O <iframe> filho é o alvo real — clique nas coordenadas do iframe.
+  const q = JSON.stringify(`#${containerId} iframe`);
+  let iframeClicado = false;
+  for (let t = 0; t < 20; t++) {
+    const coords = await cdp.evaluate(`(() => {
+      const f = document.querySelector(${q});
+      if (!f) return null;
+      const r = f.getBoundingClientRect();
+      if (r.width === 0) return null;
+      return [Math.round(r.left + r.width * 0.3), Math.round(r.top + r.height / 2)];
+    })()`);
+    if (Array.isArray(coords)) {
+      await cdp.clickAt(coords[0], coords[1]);
+      iframeClicado = true;
+      break;
+    }
+    await delay(300);
+  }
+  if (!iframeClicado) {
+    log('iframe', `${containerId}: iframe filho não apareceu — clique no container usado`);
+  }
+  await delay(randomInt(200, 500));
 
   const chars = [...String(texto).replace(/\D/g, '')];
   if (!chars.length) return;
 
-  if (iframeSessionId) {
-    // Caminho principal: teclas no contexto isolado do iframe.
-    for (let i = 0; i < chars.length; i++) {
-      await cdp.send('Input.dispatchKeyEvent', {
-        type: 'keyDown', key: chars[i], text: chars[i],
-      }, iframeSessionId);
-      await cdp.send('Input.dispatchKeyEvent', {
-        type: 'keyUp', key: chars[i],
-      }, iframeSessionId);
-      await delay(intervaloTecla(media, desvio));
-      if (pausasBloco && (i + 1) % 4 === 0 && i + 1 < chars.length) {
-        await delay(randomInt(400, 1400));
-      }
-    }
-  } else {
-    // Fallback: insertText na sessão da página.
-    // Funciona quando o renderer não isola o iframe (NST single-process).
-    log('iframe', `${containerId}: fallback insertText`);
-    for (let i = 0; i < chars.length; i++) {
-      await cdp.send('Input.insertText', { text: chars[i] });
-      await delay(intervaloTecla(media, desvio));
-      if (pausasBloco && (i + 1) % 4 === 0 && i + 1 < chars.length) {
-        await delay(randomInt(400, 1400));
-      }
+  log('iframe', `${containerId}: digitando ${chars.length} dígitos`);
+
+  // Input.dispatchKeyEvent SEM sessionId → vai ao frame com foco atual.
+  // O browser roteia para o iframe que recebeu o último clique.
+  for (let i = 0; i < chars.length; i++) {
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: chars[i], text: chars[i] });
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp',   key: chars[i] });
+    await delay(intervaloTecla(media, desvio));
+    if (pausasBloco && (i + 1) % 4 === 0 && i + 1 < chars.length) {
+      await delay(randomInt(400, 1400));
     }
   }
+  log('iframe', `${containerId}: concluído`);
 }
 
 /**
