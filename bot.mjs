@@ -673,12 +673,26 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
  *   6. botão submit       (desabilitado até SDK pronto)
  */
 /**
- * Devolve o foco à página principal clicando num elemento neutro (body).
- * Necessário após sair de um iframe PCI — o foco fica preso no iframe
- * e o próximo input de texto receberia as teclas no lugar errado.
+ * Devolve o foco à página principal após sair de um iframe PCI.
+ *
+ * Usa Input.dispatchMouseEvent via CDP (isTrusted: true) em coordenadas
+ * neutras do cabeçalho da página — fora de qualquer campo ou iframe.
+ * Não usar document.body.click() via evaluate: gera isTrusted:false,
+ * detectável pelo antifraude do MP e pode não remover foco cross-origin.
+ *
+ * Coordenadas (20, 20): canto superior esquerdo — sempre área neutra
+ * no layout do checkout (fora do formulário, fora dos iframes PCI).
  */
 async function devolverFocoPagina(cdp) {
-  await cdp.evaluate(`document.body.click()`);
+  await cdp.send('Input.dispatchMouseEvent', {
+    type: 'mousePressed', x: 20, y: 20,
+    button: 'left', buttons: 1, clickCount: 1,
+  }, cdp.sessionId);
+  await delay(randomInt(30, 60));
+  await cdp.send('Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x: 20, y: 20,
+    button: 'left', buttons: 0, clickCount: 1,
+  }, cdp.sessionId);
   await delay(80);
 }
 
