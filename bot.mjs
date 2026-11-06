@@ -835,9 +835,33 @@ async function step3Confirmacao(cdp, step, seletores, cartao, log) {
   }
   if (!botaoHabilitado) log('step3', 'botão não habilitou em 9s — tentando clicar mesmo assim');
 
-  const ok = await cdp.clicarSeletor(seletores.step3Submit);
-  if (!ok) throw new Error('Botão de autorização não encontrado.');
-  log('step3', 'submit — aguardando resposta do checkout');
+  // Clica no botão de autorização tentando pontos cada vez mais à esquerda
+  // para escapar do PainelSessao fixo (w-64, right-0) que pode interceptar
+  // o clique no centro do botão w-full.
+  // Verifica se o form foi submetido (loading=true ou página mudou) após cada tentativa.
+  const q = JSON.stringify(seletores.step3Submit);
+  let submetido = false;
+  for (const fracX of [0.25, 0.15, 0.05]) {
+    const coords = await cdp.evaluate(`(() => {
+      const el = document.querySelector(${q});
+      if (!el) return null;
+      el.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) return null;
+      return [Math.round(r.left + r.width * ${JSON.stringify(fracX)}), Math.round(r.top + r.height / 2)];
+    })()`);
+    if (!Array.isArray(coords)) throw new Error('Botão de autorização não encontrado.');
+    await cdp.clickAt(coords[0], coords[1]);
+    log('step3', `clique submit @${Math.round(fracX * 100)}% (x=${coords[0]}, y=${coords[1]})`);
+    // Verifica se o submit foi aceito: loading=true indica que o React processou o clique.
+    await delay(400);
+    const processando = await cdp.evaluate(
+      `(() => { const b = document.querySelector(${q}); return !b || b.disabled; })()`
+    );
+    if (processando) { submetido = true; log('step3', 'submit aceito — processando'); break; }
+    log('step3', `clique @${Math.round(fracX * 100)}% não surtiu efeito — tentando mais à esquerda`);
+  }
+  if (!submetido) log('step3', 'submit pode ter sido interceptado — verificar resultado no checkout');
 }
 
 // ---------------------------------------------------------------------------
