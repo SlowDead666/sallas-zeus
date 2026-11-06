@@ -783,12 +783,58 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
  * Em ambos os casos o container está presente quando esta função é chamada.
  * Aguarda um breve tempo humano, digita o CVV e submete.
  */
+/**
+ * Step 3 — confirmação do CVV.
+ *
+ * Chamado em dois fluxos:
+ *   a) após step2Cartao  → #mp-cvv2 já confirmado no final do step2
+ *   b) cartão já salvo   → esperarQualquerSeletor já confirmou #mp-cvv2
+ *
+ * Em ambos os casos o container #mp-cvv2 está presente quando esta
+ * função é chamada. Aguarda o iframe PCI montar, digita o CVV com
+ * cadência humana e aguarda o botão estar habilitado antes de clicar.
+ *
+ * O botão tem disabled={loading} — pode estar desabilitado enquanto o
+ * SDK finaliza o Token1/Token2 da etapa anterior. Aguardar é obrigatório.
+ */
 async function step3Confirmacao(cdp, step, seletores, cartao, log) {
   log('step3', 'confirmação CVV');
-  // Pausa humana de quem leu a tela antes de digitar o CVV.
+
+  // Aguarda iframe do CVV montar dentro de #mp-cvv2 (o SDK remonta
+  // securityCode neste container ao entrar no Step 3).
+  log('step3', 'aguardando iframe CVV montar em #mp-cvv2');
+  let iframePronto = false;
+  for (let i = 0; i < 30; i++) {
+    const temIframe = await cdp.evaluate(`(() => {
+      const f = document.querySelector('#mp-cvv2 iframe');
+      if (!f) return false;
+      const r = f.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    })()`);
+    if (temIframe) { iframePronto = true; log('step3', `iframe CVV pronto (${i * 400}ms)`); break; }
+    await delay(400);
+  }
+  if (!iframePronto) log('step3', 'iframe CVV não confirmado — tentando mesmo assim');
+
+  // Pausa humana de quem leu a tela antes de digitar.
   await delay(jitter(step.tempo_entre_step2_e_step3_ms ?? 2000));
   await digitarEmIframe(cdp, 'mp-cvv2', cartao.cvv, { media: 190, desvio: 55 }, log);
+  await devolverFocoPagina(cdp);
   await delay(randomInt(800, 2000));
+
+  // Aguarda o botão de autorização estar habilitado.
+  // disabled={loading} — pode estar bloqueado enquanto SDK finaliza Token2.
+  log('step3', 'aguardando botão de autorização habilitado');
+  let botaoHabilitado = false;
+  for (let i = 0; i < 30; i++) {
+    const habilitado = await cdp.evaluate(
+      `(() => { const b = document.querySelector('form button[type="submit"]'); return b && !b.disabled; })()`
+    );
+    if (habilitado) { botaoHabilitado = true; log('step3', `botão habilitado (${i * 300}ms)`); break; }
+    await delay(300);
+  }
+  if (!botaoHabilitado) log('step3', 'botão não habilitou em 9s — tentando clicar mesmo assim');
+
   const ok = await cdp.clicarSeletor(seletores.step3Submit);
   if (!ok) throw new Error('Botão de autorização não encontrado.');
   log('step3', 'submit — aguardando resposta do checkout');
