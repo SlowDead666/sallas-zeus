@@ -305,24 +305,40 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
 
   /**
    * Digita texto com cadência ~N(media, desvio) por tecla + jitter.
-   * backspaces>0 insere um erro de digitação seguido de correção
-   * em posição aleatória — padrão humano que humaniza o vetor.
+   *
+   * Simulação de erro humano (quando comErro=true):
+   *   1. Digita uma letra adjacente no alfabeto (nunca igual ao char correto)
+   *   2. Pausa curta (hesitação humana ao perceber o erro)
+   *   3. Apaga EXATAMENTE 1 caractere com Backspace
+   *   4. Redigita o caractere correto
+   *
+   * Importante: sempre exatamente 1 backspace — nunca mais, nunca menos.
+   * Mais de 1 backspace apagaria chars corretos anteriores sem redigitá-los,
+   * deixando o campo com conteúdo incompleto.
+   *
+   * A posição do erro fica no terço médio do texto (nunca no 1º char nem
+   * no último) para que a correção pareça natural.
    */
-  async function digitar(texto, { media = 160, desvio = 50, backspaces = 0 } = {}) {
+  async function digitar(texto, { media = 160, desvio = 50, comErro = false } = {}) {
     const chars = [...String(texto)];
-    // Posição do erro: terço médio do texto, nunca no primeiro char.
-    const errarEm = backspaces > 0 && chars.length > 3
-      ? randomInt(2, Math.min(chars.length - 1, Math.ceil(chars.length * 0.6)))
+    // Posição do erro: entre 20% e 60% do texto, nunca no primeiro char.
+    const errarEm = comErro && chars.length > 3
+      ? randomInt(Math.max(1, Math.floor(chars.length * 0.2)), Math.min(chars.length - 1, Math.ceil(chars.length * 0.6)))
       : -1;
     for (let i = 0; i < chars.length; i++) {
       if (i === errarEm) {
-        const errada = String.fromCharCode(chars[i].charCodeAt(0) === 97 ? 98 : 97 + randomInt(0, 25));
+        // Letra errada: adjacente no alfabeto, garantidamente diferente do char correto.
+        const code = chars[i].charCodeAt(0);
+        const erradaCode = (code >= 97 && code <= 122)
+          ? (code === 97 ? 98 : code - 1)   // 'a' → 'b'; qualquer outra → anterior
+          : (code >= 65 && code <= 90)
+            ? (code === 65 ? 66 : code - 1)  // 'A' → 'B'; qualquer outra → anterior
+            : code + 1;                       // não-letra: apenas incrementa
+        const errada = String.fromCharCode(erradaCode);
         await tecla(errada);
-        await delay(intervaloTecla(media, desvio));
-        for (let b = 0; b < backspaces; b++) {
-          await tecla('\b');
-          await delay(intervaloTecla(media * 0.8, desvio));
-        }
+        await delay(intervaloTecla(media * 1.4, desvio)); // hesitação ao perceber o erro
+        await tecla('\b');                                 // apaga EXATAMENTE 1 char
+        await delay(intervaloTecla(media * 0.9, desvio));
       }
       await tecla(chars[i]);
       await delay(intervaloTecla(media, desvio));
@@ -576,7 +592,9 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
     await cdp.digitar(valor, {
       media: jitter(stat?.inter_key_interval_ms_medio ?? 160),
       desvio: jitter(stat?.inter_key_interval_ms_desvio ?? 50),
-      backspaces: Math.random() < 0.35 ? jitter(stat?.backspaces ?? 0, { pct: 1 }) : 0,
+      // comErro: 25% de chance por campo, apenas se a matriz indica backspaces > 0.
+      // Sempre exatamente 1 erro + 1 backspace — nunca mais.
+      comErro: (stat?.backspaces ?? 0) > 0 && Math.random() < 0.25,
     });
     log('step1', `campo ${nome} digitado (${String(valor).length} chars)`);
     await delay(randomInt(300, 900));

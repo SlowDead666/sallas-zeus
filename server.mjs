@@ -58,6 +58,195 @@ export function validateSettings(body, current) {
   return next;
 }
 
+/**
+ * Gera o HTML do dashboard local de monitoramento do bot.
+ *
+ * Funcionalidades:
+ *   - Lista todos os bots ativos/concluídos/com erro em tempo real
+ *   - Exibe fase atual, cronômetro desde início, estado e log de eventos
+ *   - Polling automático a cada 1,5s via fetch para /api/bot/status/all
+ *   - Cores por estado: executando (azul), concluído (verde), erro (vermelho)
+ *   - Acessível somente em localhost — nunca exposto pelo ngrok
+ *
+ * @param {number} port - Porta do servidor Zeus
+ * @returns {string} HTML completo da página
+ */
+function dashboardHtml(port) {
+  return `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zeus — Monitor</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0f1117;color:#e2e8f0;font-family:'Segoe UI',system-ui,sans-serif;font-size:14px;padding:20px}
+  h1{font-size:20px;font-weight:700;color:#a78bfa;margin-bottom:4px;letter-spacing:.5px}
+  .sub{color:#64748b;font-size:12px;margin-bottom:20px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(480px,1fr));gap:16px}
+  .card{background:#1e2130;border:1px solid #2d3148;border-radius:12px;overflow:hidden}
+  .card-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #2d3148}
+  .card-number{font-weight:600;font-size:13px;color:#c4b5fd;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px}
+  .badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;white-space:nowrap}
+  .badge-executando{background:#1e3a5f;color:#60a5fa}
+  .badge-concluido{background:#14532d;color:#4ade80}
+  .badge-erro{background:#450a0a;color:#f87171}
+  .badge-vazio{background:#1e293b;color:#94a3b8}
+  .card-body{padding:14px 16px}
+  .meta{display:flex;gap:16px;margin-bottom:12px;flex-wrap:wrap}
+  .meta-item{display:flex;flex-direction:column;gap:2px}
+  .meta-label{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.5px}
+  .meta-value{font-size:13px;color:#e2e8f0;font-weight:500}
+  .progress{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+  .etapa{font-size:11px;padding:2px 8px;border-radius:6px;background:#2d3148;color:#94a3b8;font-weight:500}
+  .etapa-ok{background:#14532d;color:#4ade80}
+  .etapa-ativa{background:#1e3a5f;color:#60a5fa;animation:pulsar 1.2s ease-in-out infinite}
+  @keyframes pulsar{0%,100%{opacity:1}50%{opacity:.5}}
+  .log-wrap{background:#0f1117;border-radius:8px;padding:10px;max-height:200px;overflow-y:auto;border:1px solid #2d3148}
+  .log-line{font-family:monospace;font-size:11px;line-height:1.7;color:#94a3b8;white-space:pre-wrap;word-break:break-all}
+  .log-line .ts{color:#475569}
+  .log-line .tag{color:#a78bfa;font-weight:600}
+  .log-line .tag-step1{color:#34d399}
+  .log-line .tag-step2{color:#60a5fa}
+  .log-line .tag-step3{color:#f59e0b}
+  .log-line .tag-iframe{color:#c084fc}
+  .log-line .tag-erro{color:#f87171}
+  .log-line .tag-pagina{color:#fb923c}
+  .vazio{text-align:center;padding:40px;color:#475569;font-size:13px}
+  .timer{font-size:12px;color:#64748b;font-family:monospace}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
+  .dot-executando{background:#60a5fa;animation:pulsar 1s ease-in-out infinite}
+  .dot-concluido{background:#4ade80}
+  .dot-erro{background:#f87171}
+  .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+  .refresh-info{font-size:11px;color:#475569}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div>
+    <h1>⚡ Zeus Monitor</h1>
+    <div class="sub">Dashboard local — http://localhost:${port}/dashboard</div>
+  </div>
+  <div class="refresh-info" id="refresh-info">Aguardando...</div>
+</div>
+<div id="root"><div class="vazio">Nenhum bot registrado ainda.<br>Dispare um webhook para começar.</div></div>
+
+<script>
+const ETAPAS_ORDEM = ['home','item','step1','step2','step3','checkout'];
+
+function tagClass(tag) {
+  if (tag === 'step1') return 'tag-step1';
+  if (tag === 'step2') return 'tag-step2';
+  if (tag === 'step3') return 'tag-step3';
+  if (tag === 'iframe') return 'tag-iframe';
+  if (tag === 'erro' || tag === 'pagina') return 'tag-' + tag;
+  return 'tag';
+}
+
+function formatLog(eventos) {
+  if (!eventos || !eventos.length) return '<div class="log-line" style="color:#475569">Sem eventos ainda.</div>';
+  return eventos.slice().reverse().map(e => {
+    const m = e.match(/^(\\d{2}:\\d{2}:\\d{2}) \\[([^\\]]+)\\] (.+)$/);
+    if (!m) return \`<div class="log-line">\${e}</div>\`;
+    return \`<div class="log-line"><span class="ts">\${m[1]}</span> <span class="tag \${tagClass(m[2])}">[<b>\${m[2]}</b>]</span> \${escHtml(m[3])}</div>\`;
+  }).join('');
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function etapaAtual(eventos) {
+  if (!eventos) return null;
+  for (let i = eventos.length - 1; i >= 0; i--) {
+    const m = eventos[i].match(/\\[([^\\]]+)\\]/);
+    if (m && ETAPAS_ORDEM.includes(m[1])) return m[1];
+  }
+  return null;
+}
+
+function tempoDecorrido(ts) {
+  if (!ts) return '—';
+  const diff = Math.round((Date.now() - new Date(ts).getTime()) / 1000);
+  if (diff < 60) return diff + 's atrás';
+  return Math.floor(diff/60) + 'm ' + (diff%60) + 's atrás';
+}
+
+function renderCard(bot) {
+  const estado = bot.estado ?? 'vazio';
+  const etapa = etapaAtual(bot.eventos);
+  const etapas = bot.etapas ?? [];
+
+  const badgeClass = {executando:'badge-executando',concluido:'badge-concluido',erro:'badge-erro'}[estado] ?? 'badge-vazio';
+  const badgeLabel = {executando:'Executando',concluido:'Concluído',erro:'Erro'}[estado] ?? estado;
+  const dotClass = {executando:'dot-executando',concluido:'dot-concluido',erro:'dot-erro'}[estado] ?? '';
+
+  const etapasHtml = ETAPAS_ORDEM.map(e => {
+    const ok = etapas.includes(e) || (e === 'checkout' && etapas.includes('checkout'));
+    const ativa = !ok && etapa === e;
+    const cls = ok ? 'etapa-ok' : ativa ? 'etapa-ativa' : '';
+    return \`<span class="etapa \${cls}">\${e}</span>\`;
+  }).join('');
+
+  return \`
+  <div class="card">
+    <div class="card-header">
+      <div style="display:flex;align-items:center;min-width:0">
+        <span class="dot \${dotClass}"></span>
+        <span class="card-number" title="\${escHtml(bot.number)}">\${escHtml(bot.number)}</span>
+      </div>
+      <span class="badge \${badgeClass}">\${badgeLabel}</span>
+    </div>
+    <div class="card-body">
+      <div class="meta">
+        <div class="meta-item">
+          <span class="meta-label">Fase atual</span>
+          <span class="meta-value">\${etapa ?? '—'}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">Atualizado</span>
+          <span class="meta-value timer" data-ts="\${bot.ts ?? ''}">\${tempoDecorrido(bot.ts)}</span>
+        </div>
+        \${estado === 'erro' ? \`<div class="meta-item"><span class="meta-label">Erro</span><span class="meta-value" style="color:#f87171;font-size:12px">\${escHtml(bot.erro ?? '')}</span></div>\` : ''}
+      </div>
+      <div class="progress">\${etapasHtml}</div>
+      <div class="log-wrap">\${formatLog(bot.eventos)}</div>
+    </div>
+  </div>\`;
+}
+
+async function atualizar() {
+  try {
+    const r = await fetch('/api/bot/status/all');
+    const data = await r.json();
+    const bots = (data.bots ?? []).sort((a,b) => new Date(b.ts||0) - new Date(a.ts||0));
+    document.getElementById('root').innerHTML = bots.length
+      ? \`<div class="grid">\${bots.map(renderCard).join('')}</div>\`
+      : '<div class="vazio">Nenhum bot registrado ainda.<br>Dispare um webhook para começar.</div>';
+    document.getElementById('refresh-info').textContent = 'Atualizado: ' + new Date().toLocaleTimeString('pt-BR');
+  } catch(e) {
+    document.getElementById('refresh-info').textContent = 'Erro ao buscar status';
+  }
+}
+
+// Atualiza timers a cada segundo sem refetch.
+setInterval(() => {
+  document.querySelectorAll('.timer[data-ts]').forEach(el => {
+    el.textContent = el.dataset.ts ? (function(ts){
+      const diff = Math.round((Date.now() - new Date(ts).getTime()) / 1000);
+      return diff < 60 ? diff + 's atrás' : Math.floor(diff/60) + 'm ' + (diff%60) + 's atrás';
+    })(el.dataset.ts) : '—';
+  });
+}, 1000);
+
+atualizar();
+setInterval(atualizar, 1500);
+</script>
+</body>
+</html>`;
+}
+
 /** Inicializa servidor exclusivo em loopback. Configuração exige mesma origem para impedir CSRF/DNS rebinding. */
 export async function startServer({ port = 3187, publicWebhookHost = (globalThis.process.env.NGROK_HOST || 'pineal-transplanetary-lorretta.ngrok-free.dev'), store, process = createProcessor() } = {}) {
   store ??= await createStore(fileURLToPath(new URL('./.local/', import.meta.url)));
@@ -108,6 +297,18 @@ export async function startServer({ port = 3187, publicWebhookHost = (globalThis
         const number = url.searchParams.get('number') ?? '';
         const { botStatus } = await import('./core.mjs');
         return json(res, 200, { number, status: botStatus.get(number) ?? null });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/bot/status/all') {
+        // Retorna todos os bots em memória — usado pelo dashboard local.
+        const { botStatus } = await import('./core.mjs');
+        const todos = [];
+        for (const [number, status] of botStatus.entries()) todos.push({ number, ...status });
+        return json(res, 200, { bots: todos });
+      }
+      if (req.method === 'GET' && url.pathname === '/dashboard') {
+        // Dashboard local — apenas loopback, nunca exposto pelo ngrok.
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+        return res.end(dashboardHtml(server.address().port));
       }
       if (req.method === 'POST' && url.pathname === '/api/config/test') {
         await readJson(req);
