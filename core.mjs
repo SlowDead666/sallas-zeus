@@ -198,12 +198,19 @@ export function normalizePayload(body, settings) {
     if (!result.fingerprint && looseUa === undefined) throw new AppError(400, 'user_agent obrigatório quando userAgentFromWebhook está ligado (ou envie fingerprint completo).');
     if (looseUa !== undefined && result.fingerprint?.userAgent === undefined) result.fingerprint = { ...(result.fingerprint || {}), userAgent: looseUa };
   }
-  if (settings.proxyFromWebhook && body.proxy != null && body.proxy !== '') {
-    if (typeof body.proxy !== 'string') throw new AppError(400, 'proxy deve ser uma URL ou vazio.');
-    let proxy;
-    try { proxy = new URL(body.proxy); } catch { throw new AppError(400, 'URL do proxy inválida.'); }
-    if (!['http:', 'https:', 'socks5:'].includes(proxy.protocol) || !proxy.hostname || (proxy.protocol === 'socks5:' && !proxy.port)) throw new AppError(400, 'Proxy exige protocolo http/https/socks5 e host; SOCKS5 exige porta explícita.');
-    result.proxy = body.proxy;
+  if (settings.proxyFromWebhook && body.proxy != null) {
+    // proxy === false  → sem proxy algum (nem residencial integrado).
+    // proxy === ''     → sem proxy explícito; usa residencial integrado (comportamento padrão).
+    // proxy = "url"   → proxy externo validado e repassado ao NST.
+    if (body.proxy === false) {
+      result.proxy = false;
+    } else if (body.proxy !== '') {
+      if (typeof body.proxy !== 'string') throw new AppError(400, 'proxy deve ser uma URL, false ou vazio.');
+      let proxy;
+      try { proxy = new URL(body.proxy); } catch { throw new AppError(400, 'URL do proxy inválida.'); }
+      if (!['http:', 'https:', 'socks5:'].includes(proxy.protocol) || !proxy.hostname || (proxy.protocol === 'socks5:' && !proxy.port)) throw new AppError(400, 'Proxy exige protocolo http/https/socks5 e host; SOCKS5 exige porta explícita.');
+      result.proxy = body.proxy;
+    }
   }
   return result;
 }
@@ -346,8 +353,16 @@ export function createProcessor({ clientFactory = createNstClient, navigate = na
         return { ok: true, number: input.number, profileId: id, action: 'reused', url: input.url, bot: input.bot ? 'executando' : undefined };
       }
       const profile = { name: input.number, startupUrls: [input.url] };
-      if (input.proxy) profile.proxy = input.proxy;
-      else profile.builtinProxy = { type: 'residential', country: settings.country, sessionDuration: settings.sessionDuration, protocol: 'http' };
+      // proxy === false  → sem proxy algum (nem residencial integrado).
+      // proxy = "url"    → proxy externo repassado ao NST.
+      // proxy ausente    → proxy residencial integrado gerado pela API NST.
+      if (input.proxy === false) {
+        // Nenhum campo de proxy adicionado — perfil sem proxy.
+      } else if (input.proxy) {
+        profile.proxy = input.proxy;
+      } else {
+        profile.builtinProxy = { type: 'residential', country: settings.country, sessionDuration: settings.sessionDuration, protocol: 'http' };
+      }
       for (const key of ['platform', 'platformVersion', 'kernelMilestone', 'groupName', 'note']) {
         if (input[key] !== undefined) profile[key] = input[key];
       }
