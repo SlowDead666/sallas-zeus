@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { timingSafeEqual } from 'node:crypto';
 import { createStore } from './storage.mjs';
-import { AppError, createProcessor, createNstClient, validateUrl } from './core.mjs';
+import { AppError, createProcessor, createNstClient, validateUrl, botStatus } from './core.mjs';
 
 /** Responde JSON sem cache; o conteúdo da configuração nunca deve ser armazenado pelo browser. */
 function json(res, status, data) {
@@ -295,12 +295,10 @@ export async function startServer({ port = 3187, publicWebhookHost = (globalThis
       if (req.method === 'GET' && url.pathname === '/api/bot/status') {
         // Status do bot por perfil — somente leitura local, sem dados sensíveis.
         const number = url.searchParams.get('number') ?? '';
-        const { botStatus } = await import('./core.mjs');
         return json(res, 200, { number, status: botStatus.get(number) ?? null });
       }
       if (req.method === 'GET' && url.pathname === '/api/bot/status/all') {
         // Retorna todos os bots em memória — usado pelo dashboard local.
-        const { botStatus } = await import('./core.mjs');
         const todos = [];
         for (const [number, status] of botStatus.entries()) todos.push({ number, ...status });
         return json(res, 200, { bots: todos });
