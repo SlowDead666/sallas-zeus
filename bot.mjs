@@ -447,34 +447,96 @@ async function passearMouse(cdp, eventos, { x0 = 200, x1 = 1000, y0 = 150, y1 = 
  */
 /**
  * Clica num link/botão e confirma que a URL mudou após o clique.
- * Tenta 3 posições horizontais dentro do elemento para escapar de overlays.
- * Coordenadas retornadas como array [x,y] — primitivos serializáveis pelo CDP.
+ *
+ * Estratégia em 4 camadas (diagnóstico + correção no mesmo passe):
+ *   1. elementFromPoint ANTES do clique — confirma que o ponto está
+ *      livre e, se não estiver, loga o outerHTML do interceptador.
+ *   2. Tenta 3 pontos horizontais (20%/50%/80%) do elemento.
+ *   3. Todos cobertos → scroll: overlay fixed não se move, o elemento
+ *      sim — rolar tira o alvo da faixa do overlay (ex.: PainelSessao).
+ *   4. Último recurso → focus() + Enter trusted: ativação real por
+ *      teclado, imune a hit-test (Enter em <a> navega, em <button> age).
+ *
+ * Verificação de efeito: location.href muda (navegação real), nunca
+ * apenas "elemento existe" — clique cego foi a causa de falhas
+ * intermitentes quando o centro do botão caía sob overlay fixed.
  */
 async function clicarComNav(cdp, seletor, { log, nome = 'link', esperarMs = 5000 } = {}) {
   const q = JSON.stringify(seletor);
   const hrefAntes = await cdp.evaluate('location.href').catch(() => null);
 
-  for (const fracX of [0.2, 0.5, 0.8]) {
-    const frac = JSON.stringify(fracX);
-    // Retorna [x, y] como array — objetos falham em returnByValue.
-    const coords = await cdp.evaluate(`(() => {
-      const el = document.querySelector(${q});
-      if (!el) return null;
-      el.scrollIntoView({ block: 'nearest', behavior: 'instant' });
-      const r = el.getBoundingClientRect();
-      if (r.width === 0 && r.height === 0) return null;
-      return [Math.round(r.left + r.width * ${frac}), Math.round(r.top + r.height / 2)];
-    })()`);
-    if (!Array.isArray(coords)) return false;
-
-    await cdp.clickAt(coords[0], coords[1]);
+  /** Confirma a navegação por mudança real de location.href. */
+  const confirmarNav = async () => {
     const t0 = Date.now();
     while (Date.now() - t0 < esperarMs) {
       await delay(250);
       const href = await cdp.evaluate('location.href').catch(() => 'nav');
       if (href !== hrefAntes) return true;
     }
+    return false;
+  };
+
+  /**
+   * Mede o ponto @fracX do elemento e testa com elementFromPoint.
+   * Retorna [x, y, livre(0|1), interceptador(outerHTML)] ou null se o
+   * elemento não existe/está fora do viewport.
+   */
+  const pontoLivre = async fracX => {
+    const frac = JSON.stringify(fracX);
+    return cdp.evaluate(`(() => {
+      const el = document.querySelector(${q});
+      if (!el) return null;
+      el.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+      const r = el.getBoundingClientRect();
+      if (!r.width || !r.height) return null;
+      const x = Math.round(r.left + r.width * ${frac});
+      const y = Math.round(r.top + r.height / 2);
+      if (x < 1 || y < 1 || x > innerWidth - 1 || y > innerHeight - 1) return null;
+      const hit = document.elementFromPoint(x, y);
+      const livre = !!(hit && (el === hit || el.contains(hit) || hit.contains(el)));
+      const tampa = hit ? hit.outerHTML.slice(0, 80) : 'nada';
+      return [x, y, livre ? 1 : 0, tampa];
+    })()`);
+  };
+
+  // Camadas 1+2: pontos horizontais com hit-test prévio.
+  for (const fracX of [0.2, 0.5, 0.8]) {
+    const info = await pontoLivre(fracX);
+    if (!Array.isArray(info)) continue;
+    const [x, y, livre, tampa] = info;
+    if (!livre) {
+      log('nav', `${nome}: ponto @${Math.round(fracX * 100)}% coberto por: ${tampa}`);
+      continue;
+    }
+    await cdp.clickAt(x, y);
+    if (await confirmarNav()) return true;
     log('nav', `${nome}: clique @${Math.round(fracX * 100)}% sem efeito — tentando outro ponto`);
+  }
+
+  // Camada 3: overlay fixed não rola — scroll desloca o ELEMENTO para
+  // fora da faixa do overlay. Tenta descer e subir.
+  for (const delta of [240, -240]) {
+    await cdp.rolarPara(delta);
+    await delay(400);
+    const info = await pontoLivre(0.25);
+    if (!Array.isArray(info) || !info[2]) continue;
+    await cdp.clickAt(info[0], info[1]);
+    if (await confirmarNav()) return true;
+    log('nav', `${nome}: clique pós-scroll sem efeito`);
+  }
+
+  // Camada 4: focus() + Enter trusted — ativação real independente do
+  // que estiver cobrindo o elemento visualmente.
+  const focou = await cdp.evaluate(`(() => {
+    const el = document.querySelector(${q});
+    if (!el) return 0;
+    el.focus();
+    return document.activeElement === el || el.contains(document.activeElement) ? 1 : 0;
+  })()`);
+  if (focou) {
+    log('nav', `${nome}: pontos cobertos — ativando via foco + Enter`);
+    await cdp.teclaEspecial('Enter');
+    if (await confirmarNav()) return true;
   }
   return false;
 }
