@@ -252,15 +252,21 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
 
   /**
    * Digita uma tecla via Input.dispatchKeyEvent — evento trusted.
-   * caracteres comuns usam rawKeyDown/char; Backspace usa rawKeyDown
-   * com windowsVirtualKeyCode=8 (apaga de fato).
+   *
+   * dwellMs: tempo entre keyDown e keyUp (quanto o dedo "segura" a tecla).
+   * Humanos seguram ~60-100ms; dwell ~0ms é sinal clássico de bot para
+   * antifraude que mede keystroke dynamics. Vem de dwell_time_tecla_ms
+   * da matriz; padrão ~85ms nos campos PCI que não o definem.
+   *
+   * Backspace usa rawKeyDown com windowsVirtualKeyCode=8 (apaga de fato).
    */
-  async function tecla(char) {
+  async function tecla(char, dwellMs = 0) {
     if (char === '\b') {
       await send('Input.dispatchKeyEvent', {
         type: 'rawKeyDown', key: 'Backspace', code: 'Backspace',
         windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
       }, sessionId);
+      if (dwellMs) await delay(dwellMs);
       await send('Input.dispatchKeyEvent', {
         type: 'keyUp', key: 'Backspace', code: 'Backspace',
         windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
@@ -278,6 +284,7 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
       await send('Input.dispatchKeyEvent', {
         type: 'keyDown', key: char, text: char,
       }, sessionId);
+      if (dwellMs) await delay(dwellMs);
       await send('Input.dispatchKeyEvent', {
         type: 'keyUp', key: char,
       }, sessionId);
@@ -318,8 +325,11 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
    *
    * A posição do erro fica no terço médio do texto (nunca no 1º char nem
    * no último) para que a correção pareça natural.
+   *
+   * dwell: média do dwell_time_tecla_ms da matriz (ms que o dedo segura
+   * cada tecla). Jitter ±25% por tecla — humano não segura tempo fixo.
    */
-  async function digitar(texto, { media = 160, desvio = 50, comErro = false } = {}) {
+  async function digitar(texto, { media = 160, desvio = 50, comErro = false, dwell = 0 } = {}) {
     const chars = [...String(texto)];
     // Posição do erro: entre 20% e 60% do texto, nunca no primeiro char.
     const errarEm = comErro && chars.length > 3
@@ -335,12 +345,12 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
             ? (code === 65 ? 66 : code - 1)  // 'A' → 'B'; qualquer outra → anterior
             : code + 1;                       // não-letra: apenas incrementa
         const errada = String.fromCharCode(erradaCode);
-        await tecla(errada);
+        await tecla(errada, dwell ? jitter(dwell, { pct: 0.25 }) : 0);
         await delay(intervaloTecla(media * 1.4, desvio)); // hesitação ao perceber o erro
-        await tecla('\b');                                 // apaga EXATAMENTE 1 char
+        await tecla('\b', dwell ? jitter(dwell, { pct: 0.25 }) : 0); // apaga EXATAMENTE 1 char
         await delay(intervaloTecla(media * 0.9, desvio));
       }
-      await tecla(chars[i]);
+      await tecla(chars[i], dwell ? jitter(dwell, { pct: 0.25 }) : 0);
       await delay(intervaloTecla(media, desvio));
     }
   }
@@ -592,6 +602,9 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
     await cdp.digitar(valor, {
       media: jitter(stat?.inter_key_interval_ms_medio ?? 160),
       desvio: jitter(stat?.inter_key_interval_ms_desvio ?? 50),
+      // dwell_time_tecla_ms: tempo segurando cada tecla (~85ms humano).
+      // Fallback 85ms quando a matriz não fornece por campo.
+      dwell: jitter(stat?.dwell_time_tecla_ms ?? 85),
       // comErro: 25% de chance por campo, apenas se a matriz indica backspaces > 0.
       // Sempre exatamente 1 erro + 1 backspace — nunca mais.
       comErro: (stat?.backspaces ?? 0) > 0 && Math.random() < 0.25,
@@ -669,8 +682,11 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
   // Input.dispatchKeyEvent COM sessionId da página → o Chromium roteia
   // ao frame que tem o foco (o iframe clicado acima). É obrigatório passar
   // o sessionId — sem ele o comando vai ao browser target e é ignorado.
+  // Dwell ~85ms entre keyDown/keyUp — keystroke dynamics mede isso e a
+  // matriz não fornece dwell específico para os campos PCI.
   for (let i = 0; i < chars.length; i++) {
     await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: chars[i], text: chars[i] }, cdp.sessionId);
+    await delay(jitter(85, { pct: 0.25 }));
     await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp',   key: chars[i] }, cdp.sessionId);
     await delay(intervaloTecla(media, desvio));
     if (pausasBloco && (i + 1) % 4 === 0 && i + 1 < chars.length) {

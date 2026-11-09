@@ -120,6 +120,8 @@ function dashboardHtml(port) {
   .dot-erro{background:#f87171}
   .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
   .refresh-info{font-size:11px;color:#475569}
+  .btn-copy{background:#2d3148;color:#94a3b8;border:1px solid #3d4260;border-radius:6px;padding:3px 9px;font-size:11px;cursor:pointer;transition:background .15s}
+  .btn-copy:hover{background:#3d4260;color:#e2e8f0}
 </style>
 </head>
 <body>

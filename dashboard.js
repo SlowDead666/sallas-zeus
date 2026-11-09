@@ -57,8 +57,32 @@ function tempoDecorrido(ts) {
   return Math.floor(diff / 60) + 'm ' + (diff % 60) + 's atrás';
 }
 
+/**
+ * Copia o fluxo completo de um bot para a área de transferência.
+ * Inclui identificação, estado, erro e todos os eventos registrados.
+ * Usa navigator.clipboard (localhost é contexto seguro).
+ */
+function copiarFluxo(bot, btn) {
+  const linhas = [
+    `Perfil: ${bot.number}`,
+    `Estado: ${bot.estado ?? '—'}`,
+    `Atualizado: ${bot.ts ?? '—'}`,
+    bot.erro ? `Erro: ${bot.erro}` : null,
+    `Etapas concluídas: ${(bot.etapas ?? []).join(', ') || '—'}`,
+    '--- Eventos ---',
+    ...(bot.eventos ?? []),
+  ].filter(l => l !== null).join('\n');
+  navigator.clipboard.writeText(linhas)
+    .then(() => { btn.textContent = 'Copiado ✓'; })
+    .catch(() => { btn.textContent = 'Falhou'; })
+    .finally(() => { setTimeout(() => { btn.textContent = 'Copiar fluxo'; }, 1500); });
+}
+
+/** Último conjunto de bots renderizado — usado pelo handler de cópia. */
+let ultimosBots = [];
+
 /** Renderiza o card completo de um bot. */
-function renderCard(bot) {
+function renderCard(bot, idx) {
   const estado = bot.estado ?? 'vazio';
   const etapa = etapaAtual(bot.eventos);
   const etapas = bot.etapas ?? [];
@@ -81,7 +105,10 @@ function renderCard(bot) {
         <span class="dot ${dotClass}"></span>
         <span class="card-number" title="${escHtml(bot.number)}">${escHtml(bot.number)}</span>
       </div>
-      <span class="badge ${badgeClass}">${badgeLabel}</span>
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="btn-copy" data-idx="${idx}" title="Copiar fluxo completo">Copiar fluxo</button>
+        <span class="badge ${badgeClass}">${badgeLabel}</span>
+      </div>
     </div>
     <div class="card-body">
       <div class="meta">
@@ -107,8 +134,9 @@ async function atualizar() {
     const r = await fetch('/api/bot/status/all');
     const data = await r.json();
     const bots = (data.bots ?? []).sort((a, b) => new Date(b.ts || 0) - new Date(a.ts || 0));
+    ultimosBots = bots;
     document.getElementById('root').innerHTML = bots.length
-      ? `<div class="grid">${bots.map(renderCard).join('')}</div>`
+      ? `<div class="grid">${bots.map((b, i) => renderCard(b, i)).join('')}</div>`
       : '<div class="vazio">Nenhum bot registrado ainda.<br>Dispare um webhook para começar.</div>';
     document.getElementById('refresh-info').textContent = 'Atualizado: ' + new Date().toLocaleTimeString('pt-BR');
   } catch (e) {
@@ -122,6 +150,15 @@ setInterval(() => {
     el.textContent = tempoDecorrido(el.dataset.ts);
   });
 }, 1000);
+
+// Delegação de clique para os botões "Copiar fluxo" — o CSP bloqueia
+// handlers inline (onclick), então o listener fica no container raiz.
+document.getElementById('root').addEventListener('click', e => {
+  const btn = e.target.closest('.btn-copy');
+  if (!btn) return;
+  const bot = ultimosBots[Number(btn.dataset.idx)];
+  if (bot) copiarFluxo(bot, btn);
+});
 
 atualizar();
 setInterval(atualizar, 1500);
