@@ -132,117 +132,7 @@ function dashboardHtml(port) {
 </div>
 <div id="root"><div class="vazio">Nenhum bot registrado ainda.<br>Dispare um webhook para começar.</div></div>
 
-<script>
-const ETAPAS_ORDEM = ['home','item','step1','step2','step3','checkout'];
-
-function tagClass(tag) {
-  if (tag === 'step1') return 'tag-step1';
-  if (tag === 'step2') return 'tag-step2';
-  if (tag === 'step3') return 'tag-step3';
-  if (tag === 'iframe') return 'tag-iframe';
-  if (tag === 'erro' || tag === 'pagina') return 'tag-' + tag;
-  return 'tag';
-}
-
-function formatLog(eventos) {
-  if (!eventos || !eventos.length) return '<div class="log-line" style="color:#475569">Sem eventos ainda.</div>';
-  return eventos.slice().reverse().map(e => {
-    const m = e.match(/^(\\d{2}:\\d{2}:\\d{2}) \\[([^\\]]+)\\] (.+)$/);
-    if (!m) return \`<div class="log-line">\${e}</div>\`;
-    return \`<div class="log-line"><span class="ts">\${m[1]}</span> <span class="tag \${tagClass(m[2])}">[<b>\${m[2]}</b>]</span> \${escHtml(m[3])}</div>\`;
-  }).join('');
-}
-
-function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-function etapaAtual(eventos) {
-  if (!eventos) return null;
-  for (let i = eventos.length - 1; i >= 0; i--) {
-    const m = eventos[i].match(/\\[([^\\]]+)\\]/);
-    if (m && ETAPAS_ORDEM.includes(m[1])) return m[1];
-  }
-  return null;
-}
-
-function tempoDecorrido(ts) {
-  if (!ts) return '—';
-  const diff = Math.round((Date.now() - new Date(ts).getTime()) / 1000);
-  if (diff < 60) return diff + 's atrás';
-  return Math.floor(diff/60) + 'm ' + (diff%60) + 's atrás';
-}
-
-function renderCard(bot) {
-  const estado = bot.estado ?? 'vazio';
-  const etapa = etapaAtual(bot.eventos);
-  const etapas = bot.etapas ?? [];
-
-  const badgeClass = {executando:'badge-executando',concluido:'badge-concluido',erro:'badge-erro'}[estado] ?? 'badge-vazio';
-  const badgeLabel = {executando:'Executando',concluido:'Concluído',erro:'Erro'}[estado] ?? estado;
-  const dotClass = {executando:'dot-executando',concluido:'dot-concluido',erro:'dot-erro'}[estado] ?? '';
-
-  const etapasHtml = ETAPAS_ORDEM.map(e => {
-    const ok = etapas.includes(e) || (e === 'checkout' && etapas.includes('checkout'));
-    const ativa = !ok && etapa === e;
-    const cls = ok ? 'etapa-ok' : ativa ? 'etapa-ativa' : '';
-    return \`<span class="etapa \${cls}">\${e}</span>\`;
-  }).join('');
-
-  return \`
-  <div class="card">
-    <div class="card-header">
-      <div style="display:flex;align-items:center;min-width:0">
-        <span class="dot \${dotClass}"></span>
-        <span class="card-number" title="\${escHtml(bot.number)}">\${escHtml(bot.number)}</span>
-      </div>
-      <span class="badge \${badgeClass}">\${badgeLabel}</span>
-    </div>
-    <div class="card-body">
-      <div class="meta">
-        <div class="meta-item">
-          <span class="meta-label">Fase atual</span>
-          <span class="meta-value">\${etapa ?? '—'}</span>
-        </div>
-        <div class="meta-item">
-          <span class="meta-label">Atualizado</span>
-          <span class="meta-value timer" data-ts="\${bot.ts ?? ''}">\${tempoDecorrido(bot.ts)}</span>
-        </div>
-        \${estado === 'erro' ? \`<div class="meta-item"><span class="meta-label">Erro</span><span class="meta-value" style="color:#f87171;font-size:12px">\${escHtml(bot.erro ?? '')}</span></div>\` : ''}
-      </div>
-      <div class="progress">\${etapasHtml}</div>
-      <div class="log-wrap">\${formatLog(bot.eventos)}</div>
-    </div>
-  </div>\`;
-}
-
-async function atualizar() {
-  try {
-    const r = await fetch('/api/bot/status/all');
-    const data = await r.json();
-    const bots = (data.bots ?? []).sort((a,b) => new Date(b.ts||0) - new Date(a.ts||0));
-    document.getElementById('root').innerHTML = bots.length
-      ? \`<div class="grid">\${bots.map(renderCard).join('')}</div>\`
-      : '<div class="vazio">Nenhum bot registrado ainda.<br>Dispare um webhook para começar.</div>';
-    document.getElementById('refresh-info').textContent = 'Atualizado: ' + new Date().toLocaleTimeString('pt-BR');
-  } catch(e) {
-    document.getElementById('refresh-info').textContent = 'Erro ao buscar status';
-  }
-}
-
-// Atualiza timers a cada segundo sem refetch.
-setInterval(() => {
-  document.querySelectorAll('.timer[data-ts]').forEach(el => {
-    el.textContent = el.dataset.ts ? (function(ts){
-      const diff = Math.round((Date.now() - new Date(ts).getTime()) / 1000);
-      return diff < 60 ? diff + 's atrás' : Math.floor(diff/60) + 'm ' + (diff%60) + 's atrás';
-    })(el.dataset.ts) : '—';
-  });
-}, 1000);
-
-atualizar();
-setInterval(atualizar, 1500);
-</script>
+<script src="/dashboard.js"></script>
 </body>
 </html>`;
 }
@@ -307,6 +197,12 @@ export async function startServer({ port = 3187, publicWebhookHost = (globalThis
         // Dashboard local — apenas loopback, nunca exposto pelo ngrok.
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
         return res.end(dashboardHtml(server.address().port));
+      }
+      if (req.method === 'GET' && url.pathname === '/dashboard.js') {
+        // JS do dashboard servido separado — o CSP (script-src 'self')
+        // bloqueia scripts inline, então o arquivo externo é obrigatório.
+        res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
+        return res.end(await readFile(new URL('./dashboard.js', import.meta.url)));
       }
       if (req.method === 'POST' && url.pathname === '/api/config/test') {
         await readJson(req);
