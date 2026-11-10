@@ -108,12 +108,24 @@ test('chaves desconhecidas e valores inválidos no fingerprint são rejeitados c
     [{ platformVersion: '15.0.0' }, 'sem platform'],
     [{ platform: 'BeOS', platformVersion: '5' }, 'platform'],
     [{ kernelMilestone: 'abc' }, 'kernelMilestone'],
-    [{ kernelMilestone: '15' }, 'kernelMilestone'],
   ];
   for (const [patch, expected] of cases) {
     const mock = fixture();
     await assert.rejects(mock.process({ ...payload, ...patch }, settings), error => error.status === 400 && error.message.includes(expected), `caso ${expected}`);
   }
+});
+
+test('kernelMilestone não instalado é remapeado para o mais próximo instalado', async () => {
+  // 152 não está instalado — deve ser remapeado para 153 (mais próximo)
+  const mock = fixture();
+  await mock.process({ ...payload, kernelMilestone: '152' }, settings);
+  const created = mock.calls.find(call => call.path === '/profiles').body;
+  assert.strictEqual(created.kernelMilestone, '153', 'kernel 152 deve virar 153');
+  // 141 não instalado — mais próximo é 140
+  const mock2 = fixture();
+  await mock2.process({ ...payload, kernelMilestone: '141' }, settings);
+  const created2 = mock2.calls.find(call => call.path === '/profiles').body;
+  assert.strictEqual(created2.kernelMilestone, '140', 'kernel 141 deve virar 140');
 });
 
 test('userAgentFromWebhook desligado ignora fingerprint do webhook', async () => {

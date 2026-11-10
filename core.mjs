@@ -181,9 +181,17 @@ export function normalizePayload(body, settings) {
     throw new AppError(400, 'platformVersion sem platform não é aceito.');
   }
   if (body.kernelMilestone !== undefined) {
-    // A doc limita a 132-140, mas o cliente aceita todos os kernels instalados (ex: 153). Valida-se o formato; o NST rejeita milestone inexistente.
-    if (!/^\d{3}$/.test(String(body.kernelMilestone))) throw new AppError(400, "kernelMilestone deve ser o número do Chrome com 3 dígitos (ex: '140', '153').");
-    result.kernelMilestone = String(body.kernelMilestone);
+    // Kernels instalados verificados empiricamente no NST 1.23.2 (Windows).
+    // Valor fora da lista é remapeado automaticamente para o mais próximo —
+    // evita erro 400 "kernelMilestone not found" quando a IA gera um valor
+    // válido em formato mas não instalado (ex: 152 → 153).
+    const KERNELS_INSTALADOS = [124, 128, 130, 132, 135, 138, 140, 146, 149, 153];
+    const km = parseInt(String(body.kernelMilestone), 10);
+    if (isNaN(km)) throw new AppError(400, "kernelMilestone deve ser numérico (ex: '140', '153').");
+    const mais_proximo = KERNELS_INSTALADOS.reduce((prev, curr) =>
+      Math.abs(curr - km) < Math.abs(prev - km) ? curr : prev
+    );
+    result.kernelMilestone = String(mais_proximo);
   }
   for (const key of ['groupName', 'note']) {
     if (body[key] !== undefined) {
