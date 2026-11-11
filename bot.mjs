@@ -715,6 +715,20 @@ async function etapaItem(cdp, etapa, seletores, log) {
 }
 
 /**
+ * Dispensa o popup de autofill/dados do Chrome com Escape trusted.
+ * O popup é UI do browser (não aparece no DOM nem no elementFromPoint)
+ * mas captura o clique seguinte e pode preencher o campo com dados
+ * salvos do perfil — sobrescrevendo o que o bot digitaria.
+ * Escape é o gesto humano normal para fechá-lo sem aceitar sugestão.
+ */
+async function dispensarAutofill(cdp) {
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape' }, cdp.sessionId);
+  await delay(jitter(70));
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape' }, cdp.sessionId);
+  await delay(120);
+}
+
+/**
  * Foca um campo pelo clique — simples e direto.
  * Tab só entra quando o clique realmente falha (elemento não existe
  * ou coordenadas fora do viewport). Não queremos Tab como padrão.
@@ -722,6 +736,10 @@ async function etapaItem(cdp, etapa, seletores, log) {
 async function focarCampo(cdp, nome, log) {
   const sel = `[name="${nome}"]`;
   const q = JSON.stringify(sel);
+
+  // Dispensa popup de autofill antes de clicar — ele fica abaixo do
+  // campo anterior e o clique iria para a sugestão, não para o input.
+  await dispensarAutofill(cdp);
 
   // Primeira tentativa: clique normal (humano).
   const clicou = await cdp.clicarSeletor(sel);
@@ -743,6 +761,59 @@ async function focarCampo(cdp, nome, log) {
   await cdp.evaluate(`document.querySelector(${q})?.focus()`);
   await delay(60);
   return cdp.evaluate(`document.activeElement === document.querySelector(${q})`);
+}
+
+/**
+ * Digita em um input comum ([name=...]) com verificação de valor final.
+ *
+ * O popup de autofill do Chrome pode preencher o campo com dados salvos
+ * do perfil ou capturar teclas — a digitação "bem-sucedida" do ponto de
+ * vista dos eventos não garante o conteúdo do campo. Lê input.value após
+ * digitar; se divergir do esperado, limpa (Ctrl+A+Backspace) e refaz.
+ *
+ * @param {object} cdp      - sessão CDP da página
+ * @param {string} nome     - atributo name do input
+ * @param {string} valor    - valor a digitar
+ * @param {object} opts     - {media, desvio, soDigitos} — soDigitos compara
+ *                            só dígitos (campos com máscara tipo CPF)
+ * @param {Function} log    - função de log
+ * @returns {Promise<boolean>} true quando o campo confirma o valor
+ */
+async function digitarCampoVerificado(cdp, nome, valor, { media = 160, desvio = 50, soDigitos = false } = {}, log = () => {}) {
+  const sel = `[name="${nome}"]`;
+  const q = JSON.stringify(sel);
+  const esperado = soDigitos ? String(valor).replace(/\D/g, '') : String(valor);
+
+  for (let tentativa = 0; tentativa < 3; tentativa++) {
+    const focado = await focarCampo(cdp, nome, log);
+    if (!focado) return false;
+    await delay(randomInt(200, 500));
+    await cdp.digitar(valor, { media, desvio });
+
+    const atual = await cdp.evaluate(`document.querySelector(${q})?.value ?? ''`);
+    const real = soDigitos ? String(atual).replace(/\D/g, '') : String(atual);
+    // Case-insensitive: o input de titular força toUpperCase() no onInput.
+    if (real === esperado || real.toUpperCase() === esperado.toUpperCase()) {
+      log('campo', `${nome} confirmado (${real.length} chars)`);
+      return true;
+    }
+    log('campo', `${nome}: esperado "${esperado.slice(0, 14)}", lido "${real.slice(0, 14)}" — tentativa ${tentativa + 1}/3`);
+
+    // Limpa via eventos trusted: foco + Ctrl+A + Backspace.
+    // React controlado precisa de evento real — setar .value não dispara onChange.
+    await cdp.evaluate(`document.querySelector(${q})?.focus()`);
+    await delay(80);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 2 }, cdp.sessionId);
+    await delay(jitter(70));
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA' }, cdp.sessionId);
+    await delay(80);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace' }, cdp.sessionId);
+    await delay(jitter(90));
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace' }, cdp.sessionId);
+    await delay(200);
+  }
+  log('campo', `${nome} não confirmou valor após 3 tentativas`);
+  return false;
 }
 
 /**
@@ -1039,12 +1110,12 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
   await devolverFocoPagina(cdp);
   await delay(randomInt(400, 900));
 
-  // 2. Nome no cartão (input nosso).
+  // 2. Nome no cartão (input nosso) — digitação verificada: o popup de
+  // autofill do Chrome (dados de cartão/endereço) pode preencher o campo
+  // ou engolir teclas; o readback garante o conteúdo real.
   const nomeHolder = cartao.nome_titular ?? `${comprador.first_name} ${comprador.last_name}`.toUpperCase();
-  const focadoHolder = await focarCampo(cdp, seletores.campoHolder, log);
-  if (!focadoHolder) throw new Error('Campo nome do titular não focou.');
-  await delay(randomInt(200, 500));
-  await cdp.digitar(nomeHolder, { media, desvio });
+  const okHolder = await digitarCampoVerificado(cdp, seletores.campoHolder, nomeHolder, { media, desvio }, log);
+  if (!okHolder) throw new Error('Campo nome do titular não confirmou o valor digitado.');
   log('step2', `card_holder digitado (${nomeHolder.length} chars)`);
   await delay(randomInt(400, 800));
 
@@ -1062,11 +1133,10 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
   await delay(randomInt(400, 800));
 
   // 5. CPF do titular (input nosso — só dígitos; o campo formata via onInput).
+  // soDigitos compara ignorando a máscara 000.000.000-00 aplicada pelo input.
   const cpfDigitos = String(cartao.cpf_titular ?? comprador.cpf ?? '').replace(/\D/g, '');
-  const focadoCpf = await focarCampo(cdp, seletores.campoCpfTitular, log);
-  if (!focadoCpf) throw new Error('Campo CPF do titular não focou.');
-  await delay(randomInt(200, 500));
-  await cdp.digitar(cpfDigitos, { media, desvio });
+  const okCpf = await digitarCampoVerificado(cdp, seletores.campoCpfTitular, cpfDigitos, { media, desvio, soDigitos: true }, log);
+  if (!okCpf) throw new Error('Campo CPF do titular não confirmou o valor digitado.');
   log('step2', `cpf_titular digitado (${cpfDigitos.length} chars)`);
   await delay(randomInt(400, 800));
 
