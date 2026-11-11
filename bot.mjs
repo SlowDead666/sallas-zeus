@@ -873,20 +873,49 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
  * @returns {Promise<string|null>} sessionId do iframe, ou null se não achou
  */
 async function anexarIframe(cdp, containerId) {
-  // src do iframe filho — identifica o target OOPIF correto pelo URL.
+  // src do iframe filho — candidatos OOPIF são filtrados por URL.
   const src = await cdp.evaluate(
     `document.querySelector('#${containerId} iframe')?.src ?? null`
   ).catch(() => null);
   if (!src) return null;
 
   const { targetInfos } = await cdp.send('Target.getTargets').catch(() => ({ targetInfos: [] }));
-  // Match exato pelo src; fallback por prefixo (query string pode variar).
-  const alvo = targetInfos.find(t => t.type === 'iframe' && t.url === src)
-    ?? targetInfos.find(t => t.type === 'iframe' && src.startsWith(t.url.split('?')[0]));
-  if (!alvo) return null;
+  // ATENÇÃO: todos os iframes PCI do MP compartilham a mesma URL base —
+  // match por URL sozinho anexa o frame ERRADO (bug: validade/CVV iam
+  // parar dentro do campo do número). A distinção é feita pelo CONTEÚDO:
+  // cada campo hospeda um input com name/autocomplete/placeholder próprios.
+  const baseSrc = src.split('?')[0];
+  const candidatos = targetInfos.filter(t => t.type === 'iframe' && (
+    t.url === src || t.url.split('?')[0] === baseSrc || src.startsWith(t.url.split('?')[0])
+  ));
 
-  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: alvo.targetId, flatten: true });
-  return sessionId;
+  // Marcadores que identificam qual campo PCI cada frame hospeda —
+  // cobrem name, autocomplete do MP e o placeholder que nós definimos.
+  const marcadores = {
+    'mp-card-number':     /cc-number|card.?number|0000/i,
+    'mp-expiration-date': /cc-exp|expir|mm\/aa|mm\/yy/i,
+    'mp-security-code':   /cc-csc|security|cvv|csc|•/i,
+    'mp-cvv2':            /cc-csc|security|cvv|csc|•/i,
+  };
+  const re = marcadores[containerId];
+
+  for (const t of candidatos) {
+    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: t.targetId, flatten: true }).catch(() => ({}));
+    if (!sessionId) continue;
+    const info = await cdp.send('Runtime.evaluate', {
+      expression: `(() => {
+        const i = document.querySelector('input');
+        if (!i) return '';
+        return [i.name||'', i.getAttribute('autocomplete')||'', i.placeholder||'', i.id||''].join('|');
+      })()`,
+      returnByValue: true,
+    }, sessionId).catch(() => null);
+    const desc = String(info?.result?.value ?? '');
+    if (!re || re.test(desc)) return sessionId; // frame correto confirmado
+    // Frame de outro campo PCI — desanexa e tenta o próximo candidato.
+    await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {});
+  }
+  return null;
 }
 
 /**
