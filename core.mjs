@@ -380,14 +380,17 @@ export function createProcessor({ clientFactory = createNstClient, navigate = na
       if (ua && /Android|iPhone|iPad/i.test(ua)) warnings.push('UA móvel preservado; o NST utiliza motor desktop e não reproduz Android/iOS real. Coerência coberta por authentication_type no pagamento.');
       if (existing) {
         stage = 'fechar perfil antigo';
-        const running = await request('/browsers');
-        if (!Array.isArray(running)) throw new AppError(502, 'Lista de navegadores NST inválida.');
+        // GET /browsers pode retornar null ou não-array quando não há nenhum
+        // navegador aberto — tratamos como lista vazia em vez de erro, evitando
+        // falso "Lista de navegadores NST inválida" quando o perfil já estava fechado.
+        const runningRaw = await request('/browsers');
+        const running = Array.isArray(runningRaw) ? runningRaw : [];
         if (running.some(item => item.profileId === id)) {
           await request(`/browsers/${encodeURIComponent(id)}`, 'DELETE');
           let stopped = false;
           for (let attempt = 0; attempt < 30; attempt++) {
-            const browsers = await request('/browsers');
-            if (!Array.isArray(browsers)) throw new AppError(502, 'Lista de navegadores NST inválida.');
+            const browsersRaw = await request('/browsers');
+            const browsers = Array.isArray(browsersRaw) ? browsersRaw : [];
             if (!browsers.some(item => item.profileId === id)) { stopped = true; break; }
             await wait(500);
           }
