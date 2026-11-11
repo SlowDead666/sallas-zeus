@@ -885,9 +885,6 @@ async function anexarIframe(cdp, containerId) {
   // parar dentro do campo do número). A distinção é feita pelo CONTEÚDO:
   // cada campo hospeda um input com name/autocomplete/placeholder próprios.
   const baseSrc = src.split('?')[0];
-  const candidatos = targetInfos.filter(t => t.type === 'iframe' && (
-    t.url === src || t.url.split('?')[0] === baseSrc || src.startsWith(t.url.split('?')[0])
-  ));
 
   // Marcadores que identificam qual campo PCI cada frame hospeda —
   // cobrem name, autocomplete do MP e o placeholder que nós definimos.
@@ -899,23 +896,47 @@ async function anexarIframe(cdp, containerId) {
   };
   const re = marcadores[containerId];
 
-  for (const t of candidatos) {
-    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: t.targetId, flatten: true }).catch(() => ({}));
-    if (!sessionId) continue;
-    const info = await cdp.send('Runtime.evaluate', {
-      expression: `(() => {
-        const i = document.querySelector('input');
-        if (!i) return '';
-        return [i.name||'', i.getAttribute('autocomplete')||'', i.placeholder||'', i.id||''].join('|');
-      })()`,
-      returnByValue: true,
-    }, sessionId).catch(() => null);
-    const desc = String(info?.result?.value ?? '');
-    if (!re || re.test(desc)) return sessionId; // frame correto confirmado
-    // Frame de outro campo PCI — desanexa e tenta o próximo candidato.
-    await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {});
+  // Re-sondagem por até 12s: o target OOPIF só aparece quando o conteúdo
+  // do iframe comita (async, lento com proxy), e o input interno renderiza
+  // depois disso. Sem retry o PRIMEIRO campo digitado sempre caía no
+  // fallback de roteamento de foco — que não funciona em frame cross-origin.
+  const inicio = Date.now();
+  for (let ciclo = 0; ; ciclo++) {
+    const { targetInfos } = await cdp.send('Target.getTargets').catch(() => ({ targetInfos: [] }));
+    const candidatos = targetInfos.filter(t => t.type === 'iframe' && (
+      t.url === src || t.url.split('?')[0] === baseSrc || src.startsWith(t.url.split('?')[0])
+    ));
+
+    // Sem candidatos = OOPIF ainda não comitou o conteúdo do iframe —
+    // trata como "carregando" para continuar re-sondando.
+    let carregando = candidatos.length === 0;
+    for (const t of candidatos) {
+      const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: t.targetId, flatten: true }).catch(() => ({}));
+      if (!sessionId) continue;
+      const info = await cdp.send('Runtime.evaluate', {
+        expression: `(() => {
+          const i = document.querySelector('input');
+          if (!i) return '';
+          return [i.name||'', i.getAttribute('autocomplete')||'', i.placeholder||'', i.id||''].join('|');
+        })()`,
+        returnByValue: true,
+      }, sessionId).catch(() => null);
+      const desc = String(info?.result?.value ?? '');
+      if (desc === '') {
+        // Frame existe mas input interno ainda não renderizou — re-tenta.
+        carregando = true;
+        await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {});
+        continue;
+      }
+      if (!re || re.test(desc)) return sessionId; // frame correto confirmado
+      // Frame de outro campo PCI — desanexa e tenta o próximo candidato.
+      await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {});
+    }
+
+    if (!carregando && ciclo > 0) return null; // frames estáveis, nenhum bateu
+    if (Date.now() - inicio > 12000) return null;
+    await delay(500);
   }
-  return null;
 }
 
 /**
