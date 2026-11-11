@@ -787,20 +787,49 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
 }
 
 /**
+ * Anexa uma sessão CDP direta ao iframe OOPIF dentro de #containerId.
+ *
+ * Os iframes PCI do Mercado Pago são cross-origin → viram targets
+ * separados (type 'iframe') no browser. Anexar uma sessão a eles
+ * elimina toda a dependência de roteamento de foco do browser —
+ * eventos enviados na sessão do iframe chegam DIRETO ao frame, e
+ * Runtime.evaluate nele permite focar o input e ler input.value
+ * para verificar de fato que a digitação aconteceu.
+ *
+ * @param {object} cdp         - sessão CDP (conexão WebSocket da página)
+ * @param {string} containerId - id do div container sem #
+ * @returns {Promise<string|null>} sessionId do iframe, ou null se não achou
+ */
+async function anexarIframe(cdp, containerId) {
+  // src do iframe filho — identifica o target OOPIF correto pelo URL.
+  const src = await cdp.evaluate(
+    `document.querySelector('#${containerId} iframe')?.src ?? null`
+  ).catch(() => null);
+  if (!src) return null;
+
+  const { targetInfos } = await cdp.send('Target.getTargets').catch(() => ({ targetInfos: [] }));
+  // Match exato pelo src; fallback por prefixo (query string pode variar).
+  const alvo = targetInfos.find(t => t.type === 'iframe' && t.url === src)
+    ?? targetInfos.find(t => t.type === 'iframe' && src.startsWith(t.url.split('?')[0]));
+  if (!alvo) return null;
+
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: alvo.targetId, flatten: true });
+  return sessionId;
+}
+
+/**
  * Digita texto dentro de um iframe PCI do Mercado Pago.
  *
- * O MP monta um <iframe> cross-origin dentro do div #containerId.
- * Estratégia:
- *   1. Clique no container → foca o iframe visualmente (mouse trusted)
- *   2. Lê o nome do campo via atributo data-* ou pela posição do iframe
- *      dentro da lista de iframes do SDK — identifica o target correto
- *   3. Envia teclas via Input.dispatchKeyEvent sem sessionId (roteado
- *      pelo browser ao frame focado) — funciona porque o clique já
- *      focou o iframe e o browser roteia input ao frame ativo
+ * Estratégia principal (sessão OOPIF):
+ *   1. Clique no container + no iframe — eventos de mouse trusted (foco real)
+ *   2. anexarIframe() → sessionId própria do frame cross-origin
+ *   3. focus() no input via Runtime.evaluate na sessão do iframe
+ *   4. Teclas via Input.dispatchKeyEvent na sessão do iframe — chegam
+ *      direto ao frame, sem depender de roteamento de foco do browser
+ *   5. Lê input.value na sessão do iframe → VERIFICA que digitou de fato
  *
- * Nota: Input.dispatchKeyEvent sem sessionId vai ao frame COM FOCO no
- * browser — exatamente o que queremos após clicar no container.
- * Não precisamos de sessão CDP separada para o iframe.
+ * Fallback (roteamento de foco): se a sessão OOPIF não anexar, usa o
+ * caminho antigo — teclas na sessão da página confiando no foco.
  *
  * @param {object} cdp         - sessão CDP da página
  * @param {string} containerId - id do div container sem # (ex: 'mp-card-number')
@@ -809,7 +838,10 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
  * @param {Function} log       - função de log
  */
 async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 50, pausasBloco = false } = {}, log = () => {}) {
-  // Clique no container → foca o iframe visualmente.
+  const chars = [...String(texto).replace(/\D/g, '')];
+  if (!chars.length) return;
+
+  // Clique no container → foca o iframe visualmente (evento trusted).
   const ok = await cdp.clicarSeletor(`#${containerId}`);
   if (!ok) throw new Error(`Container #${containerId} não encontrado no DOM.`);
 
@@ -839,16 +871,57 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
   // Pausa extra para o iframe processar o foco — especialmente importante com proxy.
   await delay(randomInt(400, 800));
 
-  const chars = [...String(texto).replace(/\D/g, '')];
-  if (!chars.length) return;
-
   log('iframe', `${containerId}: digitando ${chars.length} dígitos`);
 
-  // Input.dispatchKeyEvent COM sessionId da página → o Chromium roteia
-  // ao frame que tem o foco (o iframe clicado acima). É obrigatório passar
-  // o sessionId — sem ele o comando vai ao browser target e é ignorado.
-  // Dwell ~85ms entre keyDown/keyUp — keystroke dynamics mede isso e a
-  // matriz não fornece dwell específico para os campos PCI.
+  // --- Caminho principal: sessão OOPIF direta no frame PCI ----------------
+  const sessaoIframe = await anexarIframe(cdp, containerId).catch(() => null);
+
+  if (sessaoIframe) {
+    log('iframe', `${containerId}: sessão OOPIF anexada — digitação direta no frame`);
+    // Foca o input dentro do iframe (DOM do frame é acessível pela sessão).
+    const foco = await cdp.send('Runtime.evaluate', {
+      expression: `(() => {
+        const i = document.querySelector('input');
+        if (!i) return 'sem-input';
+        i.focus();
+        return document.activeElement === i ? 'focado' : 'nao-focou';
+      })()`,
+      returnByValue: true,
+    }, sessaoIframe);
+    log('iframe', `${containerId}: foco interno → ${foco?.result?.value ?? '?'}`);
+
+    for (let i = 0; i < chars.length; i++) {
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: chars[i], text: chars[i] }, sessaoIframe);
+      await delay(jitter(85, { pct: 0.25 }));
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp',   key: chars[i] }, sessaoIframe);
+      await delay(intervaloTecla(media, desvio));
+      if (pausasBloco && (i + 1) % 4 === 0 && i + 1 < chars.length) {
+        await delay(randomInt(400, 1400));
+      }
+    }
+
+    // VERIFICAÇÃO: lê o valor real do input dentro do iframe.
+    // Compara só dígitos — o MP mascara o campo (espaços a cada 4).
+    const leitura = await cdp.send('Runtime.evaluate', {
+      expression: `document.querySelector('input')?.value ?? ''`,
+      returnByValue: true,
+    }, sessaoIframe).catch(() => null);
+    const valorReal = String(leitura?.result?.value ?? '');
+    const digitosReais = valorReal.replace(/\D/g, '');
+
+    // Desanexa a sessão do iframe — limpa o estado antes do próximo campo.
+    await cdp.send('Target.detachFromTarget', { sessionId: sessaoIframe }).catch(() => {});
+
+    if (digitosReais === chars.join('')) {
+      log('iframe', `${containerId}: ${digitosReais.length} dígitos confirmados no campo`);
+      return;
+    }
+    log('iframe', `${containerId}: campo tem "${valorReal.slice(0, 20)}" (${digitosReais.length}/${chars.length}) — tentando roteamento de foco`);
+  } else {
+    log('iframe', `${containerId}: sessão OOPIF não anexada — usando roteamento de foco`);
+  }
+
+  // --- Fallback: teclas na sessão da página (depende do foco no frame) ----
   for (let i = 0; i < chars.length; i++) {
     await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: chars[i], text: chars[i] }, cdp.sessionId);
     await delay(jitter(85, { pct: 0.25 }));
