@@ -198,8 +198,9 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
   /**
    * Aguarda o PRIMEIRO seletor da lista aparecer e retorna qual foi.
    * Essencial para variações de fluxo do checkout: após o Step 1 o
-   * wizard pode ir ao Step 2 (#mp-card-number) OU pular direto ao
-   * Step 3 (#mp-cvv2) quando o cartão da sessão já está salvo no MP.
+   * wizard pode ir ao Step 2 ou pular direto ao Step 3 quando o cartão
+   * da sessão já está salvo no MP — ambos exibem #mp-card-number; o que
+   * distingue é a ausência do input card_holder no Step 3.
    */
   async function esperarQualquerSeletor(lista, ms = 10000) {
     const inicio = Date.now();
@@ -834,10 +835,15 @@ async function anexarIframe(cdp, containerId) {
  * @param {object} cdp         - sessão CDP da página
  * @param {string} containerId - id do div container sem # (ex: 'mp-card-number')
  * @param {string} texto       - valor a digitar (só dígitos usados para PCI)
- * @param {object} [opts]      - media, desvio, pausasBloco
+ * @param {object} [opts]      - media, desvio, pausasBloco, limparAntes
  * @param {Function} log       - função de log
+ *
+ * limparAntes: lê o valor atual do campo via OOPIF antes de digitar.
+ * Os campos do MP retêm o valor entre desmontar/remontar — sem isso a
+ * re-tokenização do Step 3 digitaria sobre dígitos já presentes.
+ * Se o campo já contém o valor esperado, a digitação é pulada.
  */
-async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 50, pausasBloco = false } = {}, log = () => {}) {
+async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 50, pausasBloco = false, limparAntes = false } = {}, log = () => {}) {
   const chars = [...String(texto).replace(/\D/g, '')];
   if (!chars.length) return;
 
@@ -889,6 +895,33 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
       returnByValue: true,
     }, sessaoIframe);
     log('iframe', `${containerId}: foco interno → ${foco?.result?.value ?? '?'}`);
+
+    // Valor retido de uma montagem anterior (Step 3 re-tokeniza os mesmos
+    // campos do Step 2). Se já bate com o alvo, pula; se diverge, limpa.
+    if (limparAntes) {
+      const atual = await cdp.send('Runtime.evaluate', {
+        expression: `document.querySelector('input')?.value ?? ''`,
+        returnByValue: true,
+      }, sessaoIframe).catch(() => null);
+      const digitosAtuais = String(atual?.result?.value ?? '').replace(/\D/g, '');
+      if (digitosAtuais === chars.join('')) {
+        log('iframe', `${containerId}: já contém o valor esperado — digitação pulada`);
+        await cdp.send('Target.detachFromTarget', { sessionId: sessaoIframe }).catch(() => {});
+        return;
+      }
+      if (digitosAtuais.length) {
+        log('iframe', `${containerId}: campo contém ${digitosAtuais.length} dígitos retidos — limpando`);
+        // Ctrl+A + Backspace — eventos trusted na sessão do frame (modifiers 2 = Ctrl).
+        await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 2 }, sessaoIframe);
+        await delay(jitter(70));
+        await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA' }, sessaoIframe);
+        await delay(80);
+        await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace' }, sessaoIframe);
+        await delay(jitter(90));
+        await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace' }, sessaoIframe);
+        await delay(150);
+      }
+    }
 
     for (let i = 0; i < chars.length; i++) {
       await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: chars[i], text: chars[i] }, sessaoIframe);
@@ -1042,99 +1075,87 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
   await delay(jitter(step.tempo_entre_montagem_iframe_e_submit_ms ?? 3000));
   const ok = await clicarSubmit(cdp, seletores.step2Submit, { log, nome: 'step2-submit' });
   if (!ok) throw new Error('Botão do Step 2 não respondeu ao clique.');
-  log('step2', 'submit confirmado → aguardando Step 3 (mp-cvv2)');
-  await cdp.esperarSeletor('#mp-cvv2', 20000);
+  // Step 3 re-renderiza #mp-card-number (re-tokenização completa) — o que
+  // o distingue do Step 2 é a AUSÊNCIA do input card_holder no form.
+  log('step2', 'submit confirmado → aguardando Step 3');
+  for (let i = 0; i < 50; i++) {
+    const noStep3 = await cdp.evaluate(`(() =>
+      !!document.querySelector('#mp-card-number') &&
+      !document.querySelector('form input[name="card_holder"]')
+    )()`);
+    if (noStep3) break;
+    await delay(400);
+    if (i === 49) throw new Error('Checkout não avançou ao Step 3 após salvar o cartão.');
+  }
 }
 
 /**
- * Step 3 — confirmação do CVV.
+ * Step 3 — re-tokenização completa + confirmação.
+ *
+ * O /preapproval do MP não aceita token gerado por cardId (só /v1/payments
+ * aceita) — por isso o Step 3 re-exibe os 3 iframes PCI e gera um token
+ * completo, igual ao Token1. Confirmado empiricamente: token completo
+ * funciona; token de cardId retorna CC_VAL_433.
  *
  * Chamado em dois fluxos:
- *   a) após step2Cartao  → #mp-cvv2 já confirmado no final do step2
- *   b) cartão já salvo   → esperarQualquerSeletor já confirmou #mp-cvv2
+ *   a) após step2Cartao  → wizard avançou ao Step 3 (#mp-card-number sem card_holder)
+ *   b) cartão já salvo   → wizard pulou o Step 2 direto ao Step 3
  *
- * Em ambos os casos o container está presente quando esta função é chamada.
- * Aguarda um breve tempo humano, digita o CVV e submete.
- */
-/**
- * Step 3 — confirmação do CVV.
- *
- * Chamado em dois fluxos:
- *   a) após step2Cartao  → #mp-cvv2 já confirmado no final do step2
- *   b) cartão já salvo   → esperarQualquerSeletor já confirmou #mp-cvv2
- *
- * Em ambos os casos o container #mp-cvv2 está presente quando esta
- * função é chamada. Aguarda o iframe PCI montar, digita o CVV com
- * cadência humana e aguarda o botão estar habilitado antes de clicar.
- *
- * O botão tem disabled={loading} — pode estar desabilitado enquanto o
- * SDK finaliza o Token1/Token2 da etapa anterior. Aguardar é obrigatório.
+ * Os campos do MP retêm valor entre remontagens — limparAntes garante
+ * que a digitação não duplique dígitos já presentes.
  */
 async function step3Confirmacao(cdp, step, seletores, cartao, log) {
-  log('step3', 'confirmação CVV');
+  log('step3', 're-tokenização completa — aguardando iframes PCI');
+  const cad = step.cadencia_numero_cartao ?? {};
+  const cadCvv = step.cadencia_validade_cvv ?? {};
+  const media = jitter(cad.inter_key_interval_ms_medio ?? 190);
+  const desvio = jitter(cad.inter_key_interval_ms_desvio ?? 50) || 45;
 
-  // Aguarda iframe do CVV montar dentro de #mp-cvv2 (o SDK remonta
-  // securityCode neste container ao entrar no Step 3).
-  log('step3', 'aguardando iframe CVV montar em #mp-cvv2');
+  // Aguarda o iframe do número montar dentro de #mp-card-number
+  // (o SDK remonta os 3 campos ao entrar no Step 3).
+  log('step3', 'aguardando iframe montar em #mp-card-number');
   let iframePronto = false;
   for (let i = 0; i < 30; i++) {
     const temIframe = await cdp.evaluate(`(() => {
-      const f = document.querySelector('#mp-cvv2 iframe');
+      const f = document.querySelector('#mp-card-number iframe');
       if (!f) return false;
       const r = f.getBoundingClientRect();
       return r.width > 0 && r.height > 0;
     })()`);
-    if (temIframe) { iframePronto = true; log('step3', `iframe CVV pronto (${i * 400}ms)`); break; }
+    if (temIframe) { iframePronto = true; log('step3', `iframe pronto (${i * 400}ms)`); break; }
     await delay(400);
   }
-  if (!iframePronto) log('step3', 'iframe CVV não confirmado — tentando mesmo assim');
+  if (!iframePronto) log('step3', 'iframe não confirmado — tentando mesmo assim');
 
   // Pausa humana de quem leu a tela antes de digitar.
   await delay(jitter(step.tempo_entre_step2_e_step3_ms ?? 2000));
-  await digitarEmIframe(cdp, 'mp-cvv2', cartao.cvv, { media: 190, desvio: 55 }, log);
+
+  // 1. Número do cartão — limparAntes trata valor retido da montagem anterior.
+  await digitarEmIframe(cdp, 'mp-card-number', cartao.numero, {
+    media, desvio, pausasBloco: Boolean(cad.pausas_entre_blocos_4_digitos), limparAntes: true,
+  }, log);
+  await devolverFocoPagina(cdp);
+  await delay(randomInt(400, 900));
+
+  // 2. Validade (iframe PCI — formato MMAA, só dígitos).
+  const validadeDigitos = String(cartao.validade ?? '').replace(/\D/g, '').slice(0, 4);
+  await digitarEmIframe(cdp, 'mp-expiration-date', validadeDigitos, { media, desvio, limparAntes: true }, log);
+  await devolverFocoPagina(cdp);
+  await delay(randomInt(400, 800));
+
+  // 3. CVV (iframe PCI — 3 ou 4 dígitos).
+  const cvvDigitos = String(cartao.cvv ?? '').replace(/\D/g, '');
+  await digitarEmIframe(cdp, 'mp-security-code', cvvDigitos, {
+    media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio, limparAntes: true,
+  }, log);
   await devolverFocoPagina(cdp);
   await delay(randomInt(800, 2000));
 
-  // Aguarda o botão de autorização estar habilitado.
-  // disabled={loading} — pode estar bloqueado enquanto SDK finaliza Token2.
-  log('step3', 'aguardando botão de autorização habilitado');
-  let botaoHabilitado = false;
-  for (let i = 0; i < 30; i++) {
-    const habilitado = await cdp.evaluate(
-      `(() => { const b = document.querySelector('form button[type="submit"]'); return b && !b.disabled; })()`
-    );
-    if (habilitado) { botaoHabilitado = true; log('step3', `botão habilitado (${i * 300}ms)`); break; }
-    await delay(300);
-  }
-  if (!botaoHabilitado) log('step3', 'botão não habilitou em 9s — tentando clicar mesmo assim');
-
-  // Clica no botão de autorização tentando pontos cada vez mais à esquerda
-  // para escapar do PainelSessao fixo (w-64, right-0) que pode interceptar
-  // o clique no centro do botão w-full.
-  // Verifica se o form foi submetido (loading=true ou página mudou) após cada tentativa.
-  const q = JSON.stringify(seletores.step3Submit);
-  let submetido = false;
-  for (const fracX of [0.25, 0.15, 0.05]) {
-    const coords = await cdp.evaluate(`(() => {
-      const el = document.querySelector(${q});
-      if (!el) return null;
-      el.scrollIntoView({ block: 'nearest', behavior: 'instant' });
-      const r = el.getBoundingClientRect();
-      if (r.width === 0 && r.height === 0) return null;
-      return [Math.round(r.left + r.width * ${JSON.stringify(fracX)}), Math.round(r.top + r.height / 2)];
-    })()`);
-    if (!Array.isArray(coords)) throw new Error('Botão de autorização não encontrado.');
-    await cdp.clickAt(coords[0], coords[1]);
-    log('step3', `clique submit @${Math.round(fracX * 100)}% (x=${coords[0]}, y=${coords[1]})`);
-    // Verifica se o submit foi aceito: loading=true indica que o React processou o clique.
-    await delay(400);
-    const processando = await cdp.evaluate(
-      `(() => { const b = document.querySelector(${q}); return !b || b.disabled; })()`
-    );
-    if (processando) { submetido = true; log('step3', 'submit aceito — processando'); break; }
-    log('step3', `clique @${Math.round(fracX * 100)}% não surtiu efeito — tentando mais à esquerda`);
-  }
-  if (!submetido) log('step3', 'submit pode ter sido interceptado — verificar resultado no checkout');
+  // Submit — clicarSubmit faz hit-test (elementFromPoint), tenta pontos
+  // alternativos fora do PainelSessao e confirma disabled/navegação.
+  const ok = await clicarSubmit(cdp, seletores.step3Submit, { log, nome: 'step3-submit' });
+  if (!ok) throw new Error('Botão do Step 3 não respondeu ao clique.');
+  log('step3', 'submit confirmado — assinatura em processamento');
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,7 +1175,10 @@ export const SELETORES_PADRAO = {
   campoCpfTitular:'cpf_titular',
   step2Submit:    'form button[type="submit"]',
   step3Submit:    'form button[type="submit"]',
-  step3Cvv:       '#mp-cvv2',
+  /** @deprecated Step 3 não usa mais #mp-cvv2 — re-tokenização completa
+   *  com os mesmos containers do Step 2 (#mp-card-number etc.). Mantida
+   *  para compatibilidade com matrizes antigas; não é mais consultada. */
+  step3Cvv:       '#mp-security-code',
   /** Lista de cartões salvos exibida no Step 3 (cliente recorrente). */
   step3Cartoes:   'p.font-mono',
 };
@@ -1214,27 +1238,21 @@ export async function executeBot({ endpoint, matriz, comprador = {}, cartao = {}
       if (steps.get(1)) await step1Dados(cdp, steps.get(1), sel, comprador, log);
 
       // Variações de fluxo: após o Step 1 o wizard decide sozinho.
-      //   #mp-card-number → Step 2 normal (cliente novo / sem match)
-      //   #mp-cvv2        → cartão da sessão já salvo no MP; Step 2 pulado
+      // Ambos os caminhos renderizam #mp-card-number — o Step 3 re-tokeniza
+      // o cartão completo (token de cardId não é aceito no /preapproval).
+      // O que distingue os steps é o input card_holder: existe só no Step 2.
       // O DOM decide — o bot nunca presume qual variação ocorreu.
-      const proximo = await cdp.esperarQualquerSeletor(
-        [sel.step2CardNumber, sel.step3Cvv], 15000
+      await cdp.esperarSeletor(sel.step2CardNumber, 15000);
+      const temHolder = await cdp.evaluate(
+        `!!document.querySelector('form input[name="card_holder"]')`
       );
 
-      if (proximo === sel.step3Cvv) {
-        // Cartão já salvo — wizard pulou Step 2.
-        // Aguarda o iframe MP estar montado dentro de #mp-cvv2 (não só o div).
-        log('fluxo', 'variação: cartão já salvo — aguardando iframe CVV montar');
-        for (let i = 0; i < 20; i++) {
-          const temIframe = await cdp.evaluate(`!!document.querySelector('#mp-cvv2 iframe')`);
-          if (temIframe) break;
-          await delay(400);
-        }
-      } else if (proximo === sel.step2CardNumber) {
+      if (temHolder) {
         if (steps.get(2)) await step2Cartao(cdp, steps.get(2), sel, comprador, cartao, log);
         else log('fluxo', 'Step 2 no DOM mas ausente na matriz — pulando execução');
       } else {
-        throw new Error('Checkout não avançou após Step 1 — nem Step 2 nem Step 3.');
+        // Cartão da sessão já salvo no MP — wizard pulou o Step 2.
+        log('fluxo', 'variação: cartão já salvo — Step 3 direto (re-tokenização completa)');
       }
 
       if (steps.get(3)) await step3Confirmacao(cdp, steps.get(3), sel, cartao, log);
