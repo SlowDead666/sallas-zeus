@@ -870,9 +870,10 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
  *
  * @param {object} cdp         - sessão CDP (conexão WebSocket da página)
  * @param {string} containerId - id do div container sem #
+ * @param {Function} [log]     - função de log (opcional)
  * @returns {Promise<string|null>} sessionId do iframe, ou null se não achou
  */
-async function anexarIframe(cdp, containerId) {
+async function anexarIframe(cdp, containerId, log = () => {}) {
   // src do iframe filho — candidatos OOPIF são filtrados por URL.
   const src = await cdp.evaluate(
     `document.querySelector('#${containerId} iframe')?.src ?? null`
@@ -910,20 +911,34 @@ async function anexarIframe(cdp, containerId) {
     // Sem candidatos = OOPIF ainda não comitou o conteúdo do iframe —
     // trata como "carregando" para continuar re-sondando.
     let carregando = candidatos.length === 0;
+    if (ciclo === 0 || ciclo % 6 === 0) {
+      log('iframe', `${containerId}: sondagem ${ciclo + 1} — ${candidatos.length} candidato(s) OOPIF`);
+    }
     for (const t of candidatos) {
       const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: t.targetId, flatten: true }).catch(() => ({}));
       if (!sessionId) continue;
       const info = await cdp.send('Runtime.evaluate', {
         expression: `(() => {
           const i = document.querySelector('input');
-          if (!i) return '';
-          return [i.name||'', i.getAttribute('autocomplete')||'', i.placeholder||'', i.id||''].join('|');
+          const dim = innerWidth + 'x' + innerHeight;
+          if (!i) return '|' + dim;
+          return [i.name||'', i.getAttribute('autocomplete')||'', i.placeholder||'', i.id||''].join('|') + '|' + dim;
         })()`,
         returnByValue: true,
       }, sessionId).catch(() => null);
-      const desc = String(info?.result?.value ?? '');
+      const bruto = String(info?.result?.value ?? '');
+      const dimMatch = bruto.match(/(\d+)x(\d+)$/);
+      const largura = Number(dimMatch?.[1] ?? 0), altura = Number(dimMatch?.[2] ?? 0);
+      const desc = bruto.replace(/\|\d+x\d+$/, '');
+
+      // Frame oculto (antifraude/security.js do MP roda iframes 0x0/1x1 no
+      // mesmo domínio): NUNCA é um campo PCI — rejeita sem marcar carregando.
+      if (largura < 20 || altura < 15) {
+        await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {});
+        continue;
+      }
       if (desc === '') {
-        // Frame existe mas input interno ainda não renderizou — re-tenta.
+        // Frame visível mas input interno ainda não renderizou — re-tenta.
         carregando = true;
         await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {});
         continue;
@@ -933,8 +948,14 @@ async function anexarIframe(cdp, containerId) {
       await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {});
     }
 
-    if (!carregando && ciclo > 0) return null; // frames estáveis, nenhum bateu
-    if (Date.now() - inicio > 12000) return null;
+    if (!carregando && ciclo > 0) {
+      log('iframe', `${containerId}: ${candidatos.length} frame(s) estáveis, nenhum é o campo esperado`);
+      return null;
+    }
+    if (Date.now() - inicio > 12000) {
+      log('iframe', `${containerId}: OOPIF não identificado em 12s — fallback de foco`);
+      return null;
+    }
     await delay(500);
   }
 }
@@ -1001,9 +1022,16 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
   log('iframe', `${containerId}: digitando ${chars.length} dígitos`);
 
   // --- Caminho principal: sessão OOPIF direta no frame PCI ----------------
-  const sessaoIframe = await anexarIframe(cdp, containerId).catch(() => null);
+  // Até 2 tentativas: a primeira pode pegar frame ainda carregando ou com
+  // foco interno não estabelecido; re-anexar resolve casos transitórios.
+  for (let tentativa = 0; tentativa < 2; tentativa++) {
+    const sessaoIframe = await anexarIframe(cdp, containerId, log).catch(() => null);
 
-  if (sessaoIframe) {
+    if (!sessaoIframe) {
+      log('iframe', `${containerId}: sessão OOPIF não anexada (tentativa ${tentativa + 1}/2)`);
+      continue;
+    }
+
     log('iframe', `${containerId}: sessão OOPIF anexada — digitação direta no frame`);
     // Foca o input dentro do iframe (DOM do frame é acessível pela sessão).
     const foco = await cdp.send('Runtime.evaluate', {
@@ -1070,12 +1098,12 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
       log('iframe', `${containerId}: ${digitosReais.length} dígitos confirmados no campo`);
       return;
     }
-    log('iframe', `${containerId}: campo tem "${valorReal.slice(0, 20)}" (${digitosReais.length}/${chars.length}) — tentando roteamento de foco`);
-  } else {
-    log('iframe', `${containerId}: sessão OOPIF não anexada — usando roteamento de foco`);
+    log('iframe', `${containerId}: campo tem "${valorReal.slice(0, 20)}" (${digitosReais.length}/${chars.length}) — ${tentativa === 0 ? 're-anexando' : 'roteamento de foco'}`);
   }
 
   // --- Fallback: teclas na sessão da página (depende do foco no frame) ----
+  // Roteamento de foco é incerto em iframe cross-origin — usado só quando
+  // a sessão OOPIF não abre de jeito nenhum (browser sem suporte a OOPIF).
   for (let i = 0; i < chars.length; i++) {
     await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: chars[i], text: chars[i] }, cdp.sessionId);
     await delay(jitter(85, { pct: 0.25 }));
@@ -1085,7 +1113,7 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
       await delay(randomInt(400, 1400));
     }
   }
-  log('iframe', `${containerId}: concluído`);
+  log('iframe', `${containerId}: fallback executado — campo pode estar vazio`);
 }
 
 /**
