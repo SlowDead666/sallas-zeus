@@ -542,6 +542,106 @@ async function clicarComNav(cdp, seletor, { log, nome = 'link', esperarMs = 5000
 }
 
 /**
+ * Clica num botão de submit e confirma que o clique foi efetivo.
+ *
+ * Mesmo problema do clicarComNav: com telas menores o centro do botão
+ * pode cair sob o PainelSessao (fixed right-0, 256px, z-40) — o clique
+ * vai para o overlay e o bot loga "submit enviado" sem nada ter ocorrido.
+ *
+ * Estratégia em 4 camadas (igual ao clicarComNav):
+ *   1. elementFromPoint ANTES do clique — verifica se o ponto está livre.
+ *   2. 3 pontos horizontais (20%/50%/80%) do botão.
+ *   3. Scroll: overlay fixed não rola, o botão sim.
+ *   4. focus() + Enter trusted — imune a qualquer hit-test.
+ *
+ * Verificação de efeito: o botão fica disabled/loading ou sai do DOM
+ * após submit bem-sucedido — nunca apenas "clicou".
+ */
+async function clicarSubmit(cdp, seletor, { log, nome = 'submit', esperarMs = 6000 } = {}) {
+  const q = JSON.stringify(seletor);
+
+  /** Aguarda o botão ficar disabled ou sair do DOM (submit processado). */
+  const confirmarSubmit = async () => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < esperarMs) {
+      await delay(200);
+      const desativado = await cdp.evaluate(`(() => {
+        const el = document.querySelector(${q});
+        // Botão saiu do DOM (re-render) ou ficou disabled/aria-busy — submit aceito.
+        if (!el) return true;
+        if (el.disabled) return true;
+        if (el.getAttribute('aria-disabled') === 'true') return true;
+        if (el.getAttribute('aria-busy') === 'true') return true;
+        return false;
+      })()`).catch(() => true);
+      if (desativado) return true;
+    }
+    return false;
+  };
+
+  /**
+   * Mede o ponto @fracX do botão e testa com elementFromPoint.
+   * Retorna [x, y, livre(0|1), interceptador(outerHTML)] ou null.
+   */
+  const pontoLivre = async fracX => {
+    const frac = JSON.stringify(fracX);
+    return cdp.evaluate(`(() => {
+      const el = document.querySelector(${q});
+      if (!el) return null;
+      el.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+      const r = el.getBoundingClientRect();
+      if (!r.width || !r.height) return null;
+      const x = Math.round(r.left + r.width * ${frac});
+      const y = Math.round(r.top + r.height / 2);
+      if (x < 1 || y < 1 || x > innerWidth - 1 || y > innerHeight - 1) return null;
+      const hit = document.elementFromPoint(x, y);
+      const livre = !!(hit && (el === hit || el.contains(hit) || hit.contains(el)));
+      const tampa = hit ? hit.outerHTML.slice(0, 80) : 'nada';
+      return [x, y, livre ? 1 : 0, tampa];
+    })()`);
+  };
+
+  // Camadas 1+2: pontos horizontais com hit-test prévio.
+  for (const fracX of [0.2, 0.5, 0.8]) {
+    const info = await pontoLivre(fracX);
+    if (!Array.isArray(info)) continue;
+    const [x, y, livre, tampa] = info;
+    if (!livre) {
+      log('nav', `${nome}: ponto @${Math.round(fracX * 100)}% coberto por: ${tampa}`);
+      continue;
+    }
+    await cdp.clickAt(x, y);
+    if (await confirmarSubmit()) return true;
+    log('nav', `${nome}: clique @${Math.round(fracX * 100)}% sem efeito — tentando outro ponto`);
+  }
+
+  // Camada 3: scroll desloca o botão para fora da faixa do overlay fixed.
+  for (const delta of [240, -240]) {
+    await cdp.rolarPara(delta);
+    await delay(400);
+    const info = await pontoLivre(0.25);
+    if (!Array.isArray(info) || !info[2]) continue;
+    await cdp.clickAt(info[0], info[1]);
+    if (await confirmarSubmit()) return true;
+    log('nav', `${nome}: clique pós-scroll sem efeito`);
+  }
+
+  // Camada 4: focus() + Enter trusted — imune a qualquer overlay.
+  const focou = await cdp.evaluate(`(() => {
+    const el = document.querySelector(${q});
+    if (!el) return 0;
+    el.focus();
+    return document.activeElement === el || el.contains(document.activeElement) ? 1 : 0;
+  })()`);
+  if (focou) {
+    log('nav', `${nome}: pontos cobertos — ativando via foco + Enter`);
+    await cdp.teclaEspecial('Enter');
+    if (await confirmarSubmit()) return true;
+  }
+  return false;
+}
+
+/**
  * ETAPA home (/loja): dwell de navegação — scroll, mouse, hesitações,
  * hovers em cards de produto e clique no produto de saída.
  */
@@ -676,9 +776,12 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
   }
 
   await delay(jitter(step.tempo_entre_ultimo_campo_e_submit_ms ?? 2500));
-  const ok = await cdp.clicarSeletor(seletores.step1Submit);
-  if (!ok) throw new Error('Botão do Step 1 não encontrado.');
-  log('step1', 'submit enviado');
+  // clicarSubmit em vez de clicarSeletor: verifica hit-test antes de clicar
+  // e confirma que o botão ficou disabled/saiu do DOM — evita falso "submit
+  // enviado" quando o PainelSessao intercepta o clique em telas menores.
+  const ok = await clicarSubmit(cdp, seletores.step1Submit, { log, nome: 'step1-submit' });
+  if (!ok) throw new Error('Botão do Step 1 não respondeu ao clique.');
+  log('step1', 'submit confirmado');
   // BUG1 FIX: não espera step2CardNumber aqui — o orquestrador decide
   // qual step vem a seguir via esperarQualquerSeletor([step2, step3]).
 }
@@ -862,10 +965,11 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
   await delay(randomInt(400, 800));
 
   // 6. Submit — pausa humana de revisão antes de clicar.
+  // clicarSubmit confirma hit-test e disabled antes de prosseguir.
   await delay(jitter(step.tempo_entre_montagem_iframe_e_submit_ms ?? 3000));
-  const ok = await cdp.clicarSeletor(seletores.step2Submit);
-  if (!ok) throw new Error('Botão do Step 2 não encontrado.');
-  log('step2', 'submit → aguardando Step 3 (mp-cvv2)');
+  const ok = await clicarSubmit(cdp, seletores.step2Submit, { log, nome: 'step2-submit' });
+  if (!ok) throw new Error('Botão do Step 2 não respondeu ao clique.');
+  log('step2', 'submit confirmado → aguardando Step 3 (mp-cvv2)');
   await cdp.esperarSeletor('#mp-cvv2', 20000);
 }
 

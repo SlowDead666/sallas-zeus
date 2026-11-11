@@ -81,6 +81,49 @@ function copiarFluxo(bot, btn) {
 /** Último conjunto de bots renderizado — usado pelo handler de cópia. */
 let ultimosBots = [];
 
+/**
+ * Renderiza a tabela de dados do comprador e do cartão.
+ * Exibe todos os campos sem ocultar — ambiente de testes local.
+ */
+function renderDados(bot) {
+  const c = bot.comprador ?? {};
+  const k = bot.cartao ?? {};
+  const temComprador = Object.keys(c).length > 0;
+  const temCartao = Object.keys(k).length > 0;
+  if (!temComprador && !temCartao) return '';
+
+  const linha = (label, val) => val
+    ? `<tr><td style="color:#94a3b8;padding:2px 8px 2px 0;white-space:nowrap;font-size:11px">${escHtml(label)}</td><td style="font-size:11px;color:#e2e8f0;word-break:break-all">${escHtml(String(val))}</td></tr>`
+    : '';
+
+  const compradorHtml = temComprador ? `
+    <div style="margin-bottom:8px">
+      <div style="font-size:10px;font-weight:700;color:#818cf8;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Comprador</div>
+      <table style="width:100%;border-collapse:collapse">
+        ${linha('Nome', [c.first_name, c.last_name].filter(Boolean).join(' '))}
+        ${linha('E-mail', c.email)}
+        ${linha('CPF', c.cpf)}
+        ${linha('Telefone', c.telefone)}
+        ${linha('CEP', c.cep)}
+        ${linha('Endereço', [c.rua, c.numero, c.bairro, c.cidade, c.estado].filter(Boolean).join(', '))}
+      </table>
+    </div>` : '';
+
+  const cartaoHtml = temCartao ? `
+    <div>
+      <div style="font-size:10px;font-weight:700;color:#34d399;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Cartão</div>
+      <table style="width:100%;border-collapse:collapse">
+        ${linha('Número', k.numero)}
+        ${linha('Validade', k.validade)}
+        ${linha('CVV', k.cvv)}
+        ${linha('Titular', k.nome_titular)}
+        ${linha('CPF titular', k.cpf_titular)}
+      </table>
+    </div>` : '';
+
+  return `<div style="background:#0f1120;border:1px solid #2d3148;border-radius:8px;padding:10px 12px;margin-bottom:10px">${compradorHtml}${cartaoHtml}</div>`;
+}
+
 /** Renderiza o card completo de um bot. */
 function renderCard(bot, idx) {
   const estado = bot.estado ?? 'vazio';
@@ -123,6 +166,7 @@ function renderCard(bot, idx) {
         ${estado === 'erro' ? `<div class="meta-item"><span class="meta-label">Erro</span><span class="meta-value" style="color:#f87171;font-size:12px">${escHtml(bot.erro ?? '')}</span></div>` : ''}
       </div>
       <div class="progress">${etapasHtml}</div>
+      ${renderDados(bot)}
       <div class="log-wrap">${formatLog(bot.eventos)}</div>
     </div>
   </div>`;
