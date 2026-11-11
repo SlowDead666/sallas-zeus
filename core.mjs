@@ -306,7 +306,11 @@ function agendarBot(number, args, runner) {
     console.error(`[bot ${number}] ${tag}: ${msg}`);
   };
   args = { ...args, log };
-  const gravar = extra => botStatus.set(number, { ...extra, ts: new Date().toISOString(), eventos });
+  // Dados de comprador e cartão guardados no status para exibição no dashboard
+  // de testes — permite inspecionar a sessão sem consultar o payload do webhook.
+  const comprador = args.comprador ?? {};
+  const cartao = args.cartao ?? {};
+  const gravar = extra => botStatus.set(number, { ...extra, ts: new Date().toISOString(), eventos, comprador, cartao });
   gravar({ estado: 'executando' });
   Promise.resolve()
     .then(() => runner(args))
