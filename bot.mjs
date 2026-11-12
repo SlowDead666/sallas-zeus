@@ -927,10 +927,11 @@ async function anexarIframe(cdp, containerId, log = () => {}) {
       if (!sessionId) continue;
       const info = await cdp.send('Runtime.evaluate', {
         expression: `(() => {
-          const i = document.querySelector('input');
           const dim = innerWidth + 'x' + innerHeight;
-          if (!i) return '|' + dim;
-          return [i.name||'', i.getAttribute('autocomplete')||'', i.placeholder||'', i.id||''].join('|') + '|' + dim;
+          const desc = [...document.querySelectorAll('input')]
+            .map(i => [i.name||'', i.getAttribute('autocomplete')||'', i.placeholder||'', i.id||''].join('|'))
+            .join(';');
+          return desc + '|' + dim;
         })()`,
         returnByValue: true,
       }, sessionId).catch(() => null);
@@ -953,7 +954,7 @@ async function anexarIframe(cdp, containerId, log = () => {}) {
         await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {});
         continue;
       }
-      if (!re || re.test(desc)) return sessionId; // frame correto confirmado
+      if (!re || re.test(desc)) return { sessionId, targetId: t.targetId }; // frame correto confirmado
       // Frame de outro campo PCI — desanexa e tenta o próximo candidato.
       await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {});
     }
@@ -1033,10 +1034,18 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
   log('iframe', `${containerId}: digitando ${chars.length} dígitos`);
   const esperado = chars.join('');
 
+  /**
+   * Trecho JS compartilhado: escolhe o input "de verdade" dentro do frame.
+   * Frames do MP podem renderizar mais de um input (honeypots/ocultos) —
+   * filtra os visíveis e prefere o que tem atributos de campo de cartão.
+   * Declarado como `inp` para uso dentro de IIFEs de Runtime.evaluate.
+   */
+  const exprInput = `const ins=[...document.querySelectorAll('input')].filter(i=>i.getClientRects().length);const inp=ins.find(x=>/cc-|number|expir|csc|cvv|security|code/i.test([x.name,x.getAttribute('autocomplete')||'',x.placeholder||'',x.id||''].join(' ')))||ins[0]||document.querySelector('input');`;
+
   /** Lê o valor atual do input dentro do frame anexado. */
   const lerValor = async (sessao) => {
     const l = await cdp.send('Runtime.evaluate', {
-      expression: `document.querySelector('input')?.value ?? ''`,
+      expression: `(() => { ${exprInput} return inp?.value ?? ''; })()`,
       returnByValue: true,
     }, sessao).catch(() => null);
     return String(l?.result?.value ?? '');
@@ -1046,12 +1055,18 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
   // Até 3 tentativas completas: anexa → foca → digita → LÊ O VALOR.
   // O bot só avança quando o readback confirma os dígitos no campo certo.
   for (let tentativa = 0; tentativa < 3; tentativa++) {
-    const sessaoIframe = await anexarIframe(cdp, containerId, log).catch(() => null);
+    const anexo = await anexarIframe(cdp, containerId, log).catch(() => null);
+    const sessaoIframe = anexo?.sessionId ?? null;
     if (!sessaoIframe) {
       log('iframe', `${containerId}: sessão OOPIF não anexada (tentativa ${tentativa + 1}/3)`);
       continue;
     }
     log('iframe', `${containerId}: sessão OOPIF anexada (tentativa ${tentativa + 1}/3)`);
+
+    // Sem Target.activateTarget o Chromium pode descartar
+    // Input.dispatchKeyEvent destinado a um OOPIF inativo — a sessão
+    // anexa e o focus() reporta ok, mas as teclas não pousam no campo.
+    await cdp.send('Target.activateTarget', { targetId: anexo.targetId }).catch(() => {});
 
     // Leitura prévia: campo retido de montagem anterior (Step 3 re-tokeniza
     // os mesmos campos do Step 2). Igual → pula; divergente → limpa antes.
@@ -1075,14 +1090,24 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
       await delay(150);
     }
 
+    // Clique REAL dentro do frame, nas coordenadas do input — campos PCI
+    // podem exigir pointerdown trusted para inicializar os handlers
+    // internos; focus() via JS não dispara essa sequência.
+    const rectInfo = await cdp.send('Runtime.evaluate', {
+      expression: `(() => { ${exprInput} if(!inp) return null; const r=inp.getBoundingClientRect(); return [Math.round(r.left+r.width/2), Math.round(r.top+r.height/2)]; })()`,
+      returnByValue: true,
+    }, sessaoIframe);
+    const rc = rectInfo?.result?.value;
+    if (Array.isArray(rc)) {
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: rc[0], y: rc[1], button: 'left', buttons: 1, clickCount: 1 }, sessaoIframe).catch(() => {});
+      await delay(jitter(70));
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: rc[0], y: rc[1], button: 'left', buttons: 0, clickCount: 1 }, sessaoIframe).catch(() => {});
+      await delay(randomInt(150, 350));
+    }
+
     // Foca o input dentro do iframe (DOM do frame acessível pela sessão).
     const foco = await cdp.send('Runtime.evaluate', {
-      expression: `(() => {
-        const i = document.querySelector('input');
-        if (!i) return 'sem-input';
-        i.focus();
-        return document.activeElement === i ? 'focado' : 'nao-focou';
-      })()`,
+      expression: `(() => { ${exprInput} if(!inp) return 'sem-input'; inp.focus(); return document.activeElement===inp?'focado':'nao-focou'; })()`,
       returnByValue: true,
     }, sessaoIframe);
     log('iframe', `${containerId}: foco interno → ${foco?.result?.value ?? '?'}`);
@@ -1106,7 +1131,8 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
       log('iframe', `${containerId}: ${digitosReais.length} dígitos confirmados no campo`);
       return true;
     }
-    log('iframe', `${containerId}: campo tem "${valorReal.slice(0, 20)}" (${digitosReais.length}/${chars.length}) — tentativa ${tentativa + 1}/3`);
+    // Nunca logar o valor lido — pode conter dígitos do cartão.
+    log('iframe', `${containerId}: divergiu — ${digitosReais.length}/${chars.length} dígitos (tentativa ${tentativa + 1}/3)`);
     await delay(500);
   }
 
@@ -1123,7 +1149,8 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
       await delay(randomInt(400, 1400));
     }
   }
-  const sessaoFinal = await anexarIframe(cdp, containerId, log).catch(() => null);
+  const anexoFinal = await anexarIframe(cdp, containerId, log).catch(() => null);
+  const sessaoFinal = anexoFinal?.sessionId ?? null;
   if (sessaoFinal) {
     const valorFinal = await lerValor(sessaoFinal);
     await cdp.send('Target.detachFromTarget', { sessionId: sessaoFinal }).catch(() => {});
