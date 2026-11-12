@@ -874,29 +874,16 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
  * @returns {Promise<string|null>} sessionId do iframe, ou null se não achou
  */
 async function anexarIframe(cdp, containerId, log = () => {}) {
-  // src + tamanho real do elemento iframe — o OOPIF certo tem viewport
-  // (innerWidth/innerHeight) igual ao tamanho do elemento na página.
-  // Iframes ocultos de antifraude do MP (0x0/1x1) são eliminados pelo
-  // tamanho, não por threshold arbitrário.
-  const alvo = await cdp.evaluate(`(() => {
-    const f = document.querySelector('#${containerId} iframe');
-    if (!f) return null;
-    const r = f.getBoundingClientRect();
-    return { src: f.src, w: Math.round(r.width), h: Math.round(r.height) };
-  })()`).catch(() => null);
-  const src = alvo?.src ?? null;
-  const esperadoW = alvo?.w ?? 0, esperadoH = alvo?.h ?? 0;
-  if (!src) return null;
-
   // ATENÇÃO: todos os iframes PCI do MP compartilham a mesma URL base —
   // match por URL sozinho anexa o frame ERRADO (bug: validade/CVV iam
   // parar dentro do campo do número). A distinção é feita pelo CONTEÚDO:
   // cada campo hospeda um input com name/autocomplete/placeholder próprios
   // e viewport igual ao elemento iframe do container.
-  const baseSrc = src.split('?')[0];
-
-  // Marcadores que identificam qual campo PCI cada frame hospeda —
-  // cobrem name, autocomplete do MP e o placeholder que nós definimos.
+  //
+  // O elemento iframe e o src são relidos a CADA ciclo: logo após a troca
+  // de step o container existe mas o <iframe> ainda não montou — antes o
+  // retorno era null instantâneo e as 3 tentativas rodavam no mesmo
+  // segundo, todas falhando.
   const marcadores = {
     'mp-card-number':     /cc-number|card.?number|0000/i,
     'mp-expiration-date': /cc-exp|expir|mm\/aa|mm\/yy/i,
@@ -905,12 +892,39 @@ async function anexarIframe(cdp, containerId, log = () => {}) {
   };
   const re = marcadores[containerId];
 
-  // Re-sondagem por até 12s: o target OOPIF só aparece quando o conteúdo
-  // do iframe comita (async, lento com proxy), e o input interno renderiza
-  // depois disso. Sem retry o PRIMEIRO campo digitado sempre caía no
-  // fallback de roteamento de foco — que não funciona em frame cross-origin.
+  // Re-sondagem por até 15s: o elemento iframe monta async, o target OOPIF
+  // só aparece quando o conteúdo comita (async, lento com proxy), e o
+  // input interno renderiza depois disso.
   const inicio = Date.now();
   for (let ciclo = 0; ; ciclo++) {
+    // src + tamanho real do elemento iframe — o OOPIF certo tem viewport
+    // (innerWidth/innerHeight) igual ao tamanho do elemento na página.
+    // Iframes ocultos de antifraude do MP (0x0/1x1) são eliminados pelo
+    // tamanho, não por threshold arbitrário.
+    const alvo = await cdp.evaluate(`(() => {
+      const f = document.querySelector('#${containerId} iframe');
+      if (!f) return null;
+      const r = f.getBoundingClientRect();
+      return { src: f.src, w: Math.round(r.width), h: Math.round(r.height) };
+    })()`).catch(() => null);
+    const src = alvo?.src ?? null;
+    const esperadoW = alvo?.w ?? 0, esperadoH = alvo?.h ?? 0;
+
+    // Iframe ainda não montado = "carregando" — continua sondando em vez
+    // de desistir na hora.
+    if (!src) {
+      if (ciclo === 0 || ciclo % 6 === 0) {
+        log('iframe', `${containerId}: aguardando iframe montar (ciclo ${ciclo + 1})`);
+      }
+      if (Date.now() - inicio > 15000) {
+        log('iframe', `${containerId}: elemento iframe não montou em 15s`);
+        return null;
+      }
+      await delay(500);
+      continue;
+    }
+    const baseSrc = src.split('?')[0];
+
     const { targetInfos } = await cdp.send('Target.getTargets').catch(() => ({ targetInfos: [] }));
     const candidatos = targetInfos.filter(t => t.type === 'iframe' && (
       t.url === src || t.url.split('?')[0] === baseSrc || src.startsWith(t.url.split('?')[0])
@@ -936,6 +950,8 @@ async function anexarIframe(cdp, containerId, log = () => {}) {
         returnByValue: true,
       }, sessionId).catch(() => null);
       const bruto = String(info?.result?.value ?? '');
+      // Evaluate falhou = frame ainda carregando — não conta como "estável".
+      if (bruto === '') { carregando = true; await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {}); continue; }
       const dimMatch = bruto.match(/(\d+)x(\d+)$/);
       const largura = Number(dimMatch?.[1] ?? 0), altura = Number(dimMatch?.[2] ?? 0);
       const desc = bruto.replace(/\|\d+x\d+$/, '');
@@ -959,12 +975,16 @@ async function anexarIframe(cdp, containerId, log = () => {}) {
       await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {});
     }
 
-    if (!carregando && ciclo > 0) {
+    // Saída antecipada só após ~4s de inspeção estável: os OUTROS campos
+    // PCI do step montam juntos — se o nosso ainda não comitou mas os
+    // demais já estão prontos, desistir aqui era o bug das tentativas
+    // instantâneas. O timeout de 15s segue como limite duro.
+    if (!carregando && ciclo > 8) {
       log('iframe', `${containerId}: ${candidatos.length} frame(s) estáveis, nenhum é o campo esperado`);
       return null;
     }
-    if (Date.now() - inicio > 12000) {
-      log('iframe', `${containerId}: OOPIF não identificado em 12s — fallback de foco`);
+    if (Date.now() - inicio > 15000) {
+      log('iframe', `${containerId}: OOPIF não identificado em 15s — fallback de foco`);
       return null;
     }
     await delay(500);
@@ -1059,6 +1079,8 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
     const sessaoIframe = anexo?.sessionId ?? null;
     if (!sessaoIframe) {
       log('iframe', `${containerId}: sessão OOPIF não anexada (tentativa ${tentativa + 1}/3)`);
+      // 1s de respiro antes da próxima tentativa — dá tempo do frame comitar.
+      if (tentativa < 2) await delay(1000);
       continue;
     }
     log('iframe', `${containerId}: sessão OOPIF anexada (tentativa ${tentativa + 1}/3)`);
@@ -1133,7 +1155,8 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
     }
     // Nunca logar o valor lido — pode conter dígitos do cartão.
     log('iframe', `${containerId}: divergiu — ${digitosReais.length}/${chars.length} dígitos (tentativa ${tentativa + 1}/3)`);
-    await delay(500);
+    // 1s de respiro antes da próxima tentativa.
+    if (tentativa < 2) await delay(1000);
   }
 
   // --- Fallback final: roteamento de foco + verificação OOPIF --------------
@@ -1212,6 +1235,9 @@ async function devolverFocoPagina(cdp) {
  */
 async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
   log('step2', 'cartão — aguardando SDK MP estar pronto');
+  // Respiro pós-mudança de step: os iframes PCI montam async — 3s antes
+  // de qualquer interação evita sondar um DOM ainda não commitado.
+  await delay(3000);
   const cad = step.cadencia_numero_cartao ?? {};
   const cadCvv = step.cadencia_validade_cvv ?? {};
   const media = jitter(cad.inter_key_interval_ms_medio ?? 190);
@@ -1304,6 +1330,9 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
  */
 async function step3Confirmacao(cdp, step, seletores, cartao, log) {
   log('step3', 're-tokenização completa — aguardando iframes PCI');
+  // Respiro pós-mudança de step: os iframes PCI remontam async — 3s antes
+  // de qualquer interação evita sondar um DOM ainda não commitado.
+  await delay(3000);
   const cad = step.cadencia_numero_cartao ?? {};
   const cadCvv = step.cadencia_validade_cvv ?? {};
   const media = jitter(cad.inter_key_interval_ms_medio ?? 190);
