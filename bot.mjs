@@ -779,7 +779,7 @@ async function focarCampo(cdp, nome, log) {
  * @param {Function} log    - função de log
  * @returns {Promise<boolean>} true quando o campo confirma o valor
  */
-async function digitarCampoVerificado(cdp, nome, valor, { media = 160, desvio = 50, soDigitos = false } = {}, log = () => {}) {
+async function digitarCampoVerificado(cdp, nome, valor, { media = 160, desvio = 50, soDigitos = false, digitarOpts = {} } = {}, log = () => {}) {
   const sel = `[name="${nome}"]`;
   const q = JSON.stringify(sel);
   const esperado = soDigitos ? String(valor).replace(/\D/g, '') : String(valor);
@@ -788,7 +788,7 @@ async function digitarCampoVerificado(cdp, nome, valor, { media = 160, desvio = 
     const focado = await focarCampo(cdp, nome, log);
     if (!focado) return false;
     await delay(randomInt(200, 500));
-    await cdp.digitar(valor, { media, desvio });
+    await cdp.digitar(valor, { media, desvio, ...digitarOpts });
 
     const atual = await cdp.evaluate(`document.querySelector(${q})?.value ?? ''`);
     const real = soDigitos ? String(atual).replace(/\D/g, '') : String(atual);
@@ -825,25 +825,33 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
   log('step1', 'dados pessoais');
   const porCampo = new Map((step.campos ?? []).map(c => [c.campo, c]));
 
+  // Campos com máscara no input (cpf/telefone/cep) comparam só dígitos.
+  const camposMascarados = new Set(['cpf', 'telefone', 'cep']);
   for (const campo of seletores.step1Campos) {
     const nome = campo.name;
     const valor = comprador[nome];
     if (valor === undefined || valor === null || valor === '') continue;
     const stat = porCampo.get(nome) ?? porCampo.values().next().value;
-    const focado = await focarCampo(cdp, nome, log);
-    if (!focado) { log('step1', `campo ${nome} sem foco — pulando`); continue; }
-    await delay(randomInt(200, 700));
-    await cdp.digitar(valor, {
+    // Campos mascarados recebem SÓ dígitos — a máscara do input formata;
+    // digitar "(" ou "-" cru pode quebrar a formatação do campo.
+    const valorDigitar = camposMascarados.has(nome) ? String(valor).replace(/\D/g, '') : valor;
+    // Digitação verificada em TODOS os campos — o Step 1 tinha o mesmo
+    // bug dos iframes: logava "digitado" sem provar que o valor entrou.
+    const ok = await digitarCampoVerificado(cdp, nome, valorDigitar, {
       media: jitter(stat?.inter_key_interval_ms_medio ?? 160),
       desvio: jitter(stat?.inter_key_interval_ms_desvio ?? 50),
-      // dwell_time_tecla_ms: tempo segurando cada tecla (~85ms humano).
-      // Fallback 85ms quando a matriz não fornece por campo.
-      dwell: jitter(stat?.dwell_time_tecla_ms ?? 85),
-      // comErro: 25% de chance por campo, apenas se a matriz indica backspaces > 0.
-      // Sempre exatamente 1 erro + 1 backspace — nunca mais.
-      comErro: (stat?.backspaces ?? 0) > 0 && Math.random() < 0.25,
-    });
-    log('step1', `campo ${nome} digitado (${String(valor).length} chars)`);
+      soDigitos: camposMascarados.has(nome),
+      digitarOpts: {
+        // dwell_time_tecla_ms: tempo segurando cada tecla (~85ms humano).
+        // Fallback 85ms quando a matriz não fornece por campo.
+        dwell: jitter(stat?.dwell_time_tecla_ms ?? 85),
+        // comErro: 25% de chance por campo, apenas se a matriz indica backspaces > 0.
+        // Sempre exatamente 1 erro + 1 backspace — nunca mais.
+        comErro: (stat?.backspaces ?? 0) > 0 && Math.random() < 0.25,
+      },
+    }, log);
+    if (!ok) throw new Error(`Step 1: campo ${nome} não confirmou o valor digitado.`);
+    log('step1', `campo ${nome} confirmado (${String(valor).length} chars)`);
     await delay(randomInt(300, 900));
   }
 
@@ -1125,31 +1133,10 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
     // sessão OOPIF (direto no target). O readback decide qual funcionou.
     const sessaoTeclas = tentativa % 2 === 0 ? cdp.sessionId : sessaoIframe;
 
-    // Leitura prévia: campo retido de montagem anterior (Step 3 re-tokeniza
-    // os mesmos campos do Step 2). Igual → pula; divergente → limpa antes.
-    const valorInicial = await lerValor(sessaoIframe);
-    const digitosIniciais = valorInicial.replace(/\D/g, '');
-    if (digitosIniciais === esperado) {
-      log('iframe', `${containerId}: já contém o valor esperado — confirmado sem digitar`);
-      await cdp.send('Target.detachFromTarget', { sessionId: sessaoIframe }).catch(() => {});
-      return true;
-    }
-    if (digitosIniciais.length) {
-      log('iframe', `${containerId}: ${digitosIniciais.length} dígitos divergentes — limpando`);
-      // Ctrl+A + Backspace — eventos trusted (modifiers 2 = Ctrl).
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 2 }, sessaoTeclas);
-      await delay(jitter(70));
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA' }, sessaoTeclas);
-      await delay(80);
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace' }, sessaoTeclas);
-      await delay(jitter(90));
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace' }, sessaoTeclas);
-      await delay(150);
-    }
-
-    // Clique REAL dentro do frame, nas coordenadas do input — campos PCI
-    // podem exigir pointerdown trusted para inicializar os handlers
-    // internos; focus() via JS não dispara essa sequência.
+    // ORDEM OBRIGATÓRIA: clique real dentro do frame + foco ANTES de
+    // ler/limpar/digitar. Antes a limpeza rodava sem foco — o Ctrl+A/
+    // Backspace caía na página (ou no frame anterior) e o campo
+    // "divergente" nunca era esvaziado, acumulando dígitos de tentativas.
     const rectInfo = await cdp.send('Runtime.evaluate', {
       expression: `(() => { ${exprInput} if(!inp) return null; const r=inp.getBoundingClientRect(); return [Math.round(r.left+r.width/2), Math.round(r.top+r.height/2)]; })()`,
       returnByValue: true,
@@ -1168,6 +1155,36 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
       returnByValue: true,
     }, sessaoIframe);
     log('iframe', `${containerId}: foco interno → ${foco?.result?.value ?? '?'}`);
+
+    // Leitura prévia COM foco estabelecido: campo retido de montagem
+    // anterior (Step 3 re-tokeniza os mesmos campos do Step 2). Igual →
+    // pula; divergente → limpa de verdade antes de digitar.
+    const valorInicial = await lerValor(sessaoIframe);
+    const digitosIniciais = valorInicial.replace(/\D/g, '');
+    if (digitosIniciais === esperado) {
+      log('iframe', `${containerId}: já contém o valor esperado — confirmado sem digitar`);
+      await cdp.send('Target.detachFromTarget', { sessionId: sessaoIframe }).catch(() => {});
+      return true;
+    }
+    if (digitosIniciais.length) {
+      log('iframe', `${containerId}: ${digitosIniciais.length} dígitos divergentes — limpando`);
+      // Ctrl+A + Backspace pela MESMA sessão que vai digitar — o input
+      // já está focado dentro do frame, então as teclas caem nele.
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 2 }, sessaoTeclas);
+      await delay(jitter(70));
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA' }, sessaoTeclas);
+      await delay(80);
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace' }, sessaoTeclas);
+      await delay(jitter(90));
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace' }, sessaoTeclas);
+      await delay(150);
+      // Confirma que esvaziou de verdade — se restou dígito, o campo
+      // recusou a limpeza e digitar por cima só pioraria a divergência.
+      const resto = (await lerValor(sessaoIframe)).replace(/\D/g, '');
+      if (resto.length) {
+        log('iframe', `${containerId}: limpeza incompleta — ${resto.length} dígito(s) restante(s)`);
+      }
+    }
 
     for (let i = 0; i < chars.length; i++) {
       await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: chars[i], text: chars[i] }, sessaoTeclas);
