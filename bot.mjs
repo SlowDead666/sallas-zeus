@@ -891,6 +891,10 @@ async function anexarIframe(cdp, containerId, log = () => {}) {
     'mp-cvv2':            /cc-csc|security|cvv|csc|•/i,
   };
   const re = marcadores[containerId];
+  // frameId do iframe do NOSSO container — correlação determinística:
+  // o targetId do target OOPIF é o mesmo frameId. Elimina o chute por
+  // marcador/tamanho quando dois campos PCI têm a mesma dimensão.
+  let frameId = null;
 
   // Re-sondagem por até 15s: o elemento iframe monta async, o target OOPIF
   // só aparece quando o conteúdo comita (async, lento com proxy), e o
@@ -925,10 +929,36 @@ async function anexarIframe(cdp, containerId, log = () => {}) {
     }
     const baseSrc = src.split('?')[0];
 
+    // Resolve o frameId do iframe deste container (uma vez — o elemento
+    // não troca de identidade depois de montado).
+    if (!frameId) {
+      frameId = await cdp.send('DOM.getDocument', { depth: -1 })
+        .then(doc => cdp.send('DOM.querySelector', {
+          nodeId: doc.root.nodeId, selector: `#${containerId} iframe`,
+        }))
+        .then(n => n.nodeId
+          ? cdp.send('DOM.describeNode', { nodeId: n.nodeId })
+          : null)
+        .then(d => d?.node?.frameId ?? null)
+        .catch(() => null);
+    }
+
     const { targetInfos } = await cdp.send('Target.getTargets').catch(() => ({ targetInfos: [] }));
     const candidatos = targetInfos.filter(t => t.type === 'iframe' && (
       t.url === src || t.url.split('?')[0] === baseSrc || src.startsWith(t.url.split('?')[0])
     ));
+
+    // Caminho determinístico: se o frameId foi resolvido e o OOPIF com
+    // esse targetId existe, é ELE — sem marcador, sem tamanho, sem chute.
+    if (frameId) {
+      const exato = candidatos.find(t => t.targetId === frameId);
+      if (exato) {
+        const { sessionId } = await cdp.send('Target.attachToTarget', {
+          targetId: exato.targetId, flatten: true,
+        }).catch(() => ({}));
+        if (sessionId) return { sessionId, targetId: exato.targetId };
+      }
+    }
 
     // Sem candidatos = OOPIF ainda não comitou o conteúdo do iframe —
     // trata como "carregando" para continuar re-sondando.
@@ -1079,8 +1109,8 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
     const sessaoIframe = anexo?.sessionId ?? null;
     if (!sessaoIframe) {
       log('iframe', `${containerId}: sessão OOPIF não anexada (tentativa ${tentativa + 1}/3)`);
-      // 1s de respiro antes da próxima tentativa — dá tempo do frame comitar.
-      if (tentativa < 2) await delay(1000);
+      // Respiro de alguns segundos antes da próxima tentativa.
+      if (tentativa < 2) await delay(randomInt(1500, 3000));
       continue;
     }
     log('iframe', `${containerId}: sessão OOPIF anexada (tentativa ${tentativa + 1}/3)`);
@@ -1089,6 +1119,11 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
     // Input.dispatchKeyEvent destinado a um OOPIF inativo — a sessão
     // anexa e o focus() reporta ok, mas as teclas não pousam no campo.
     await cdp.send('Target.activateTarget', { targetId: anexo.targetId }).catch(() => {});
+
+    // Sessão que carrega as TECLAS: alterna entre a sessão da página
+    // (o foco real dentro do frame atrai as teclas — caminho humano) e a
+    // sessão OOPIF (direto no target). O readback decide qual funcionou.
+    const sessaoTeclas = tentativa % 2 === 0 ? cdp.sessionId : sessaoIframe;
 
     // Leitura prévia: campo retido de montagem anterior (Step 3 re-tokeniza
     // os mesmos campos do Step 2). Igual → pula; divergente → limpa antes.
@@ -1101,14 +1136,14 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
     }
     if (digitosIniciais.length) {
       log('iframe', `${containerId}: ${digitosIniciais.length} dígitos divergentes — limpando`);
-      // Ctrl+A + Backspace — eventos trusted na sessão do frame (modifiers 2 = Ctrl).
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 2 }, sessaoIframe);
+      // Ctrl+A + Backspace — eventos trusted (modifiers 2 = Ctrl).
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 2 }, sessaoTeclas);
       await delay(jitter(70));
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA' }, sessaoIframe);
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA' }, sessaoTeclas);
       await delay(80);
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace' }, sessaoIframe);
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace' }, sessaoTeclas);
       await delay(jitter(90));
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace' }, sessaoIframe);
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace' }, sessaoTeclas);
       await delay(150);
     }
 
@@ -1135,9 +1170,9 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
     log('iframe', `${containerId}: foco interno → ${foco?.result?.value ?? '?'}`);
 
     for (let i = 0; i < chars.length; i++) {
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: chars[i], text: chars[i] }, sessaoIframe);
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: chars[i], text: chars[i] }, sessaoTeclas);
       await delay(jitter(85, { pct: 0.25 }));
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp',   key: chars[i] }, sessaoIframe);
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp',   key: chars[i] }, sessaoTeclas);
       await delay(intervaloTecla(media, desvio));
       if (pausasBloco && (i + 1) % 4 === 0 && i + 1 < chars.length) {
         await delay(randomInt(400, 1400));
@@ -1155,8 +1190,8 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
     }
     // Nunca logar o valor lido — pode conter dígitos do cartão.
     log('iframe', `${containerId}: divergiu — ${digitosReais.length}/${chars.length} dígitos (tentativa ${tentativa + 1}/3)`);
-    // 1s de respiro antes da próxima tentativa.
-    if (tentativa < 2) await delay(1000);
+    // Respiro de alguns segundos antes da próxima tentativa.
+    if (tentativa < 2) await delay(randomInt(1500, 3000));
   }
 
   // --- Fallback final: roteamento de foco + verificação OOPIF --------------
