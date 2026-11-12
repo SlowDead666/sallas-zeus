@@ -874,17 +874,25 @@ async function step1Dados(cdp, step, seletores, comprador, log) {
  * @returns {Promise<string|null>} sessionId do iframe, ou null se não achou
  */
 async function anexarIframe(cdp, containerId, log = () => {}) {
-  // src do iframe filho — candidatos OOPIF são filtrados por URL.
-  const src = await cdp.evaluate(
-    `document.querySelector('#${containerId} iframe')?.src ?? null`
-  ).catch(() => null);
+  // src + tamanho real do elemento iframe — o OOPIF certo tem viewport
+  // (innerWidth/innerHeight) igual ao tamanho do elemento na página.
+  // Iframes ocultos de antifraude do MP (0x0/1x1) são eliminados pelo
+  // tamanho, não por threshold arbitrário.
+  const alvo = await cdp.evaluate(`(() => {
+    const f = document.querySelector('#${containerId} iframe');
+    if (!f) return null;
+    const r = f.getBoundingClientRect();
+    return { src: f.src, w: Math.round(r.width), h: Math.round(r.height) };
+  })()`).catch(() => null);
+  const src = alvo?.src ?? null;
+  const esperadoW = alvo?.w ?? 0, esperadoH = alvo?.h ?? 0;
   if (!src) return null;
 
-  const { targetInfos } = await cdp.send('Target.getTargets').catch(() => ({ targetInfos: [] }));
   // ATENÇÃO: todos os iframes PCI do MP compartilham a mesma URL base —
   // match por URL sozinho anexa o frame ERRADO (bug: validade/CVV iam
   // parar dentro do campo do número). A distinção é feita pelo CONTEÚDO:
-  // cada campo hospeda um input com name/autocomplete/placeholder próprios.
+  // cada campo hospeda um input com name/autocomplete/placeholder próprios
+  // e viewport igual ao elemento iframe do container.
   const baseSrc = src.split('?')[0];
 
   // Marcadores que identificam qual campo PCI cada frame hospeda —
@@ -931,9 +939,11 @@ async function anexarIframe(cdp, containerId, log = () => {}) {
       const largura = Number(dimMatch?.[1] ?? 0), altura = Number(dimMatch?.[2] ?? 0);
       const desc = bruto.replace(/\|\d+x\d+$/, '');
 
-      // Frame oculto (antifraude/security.js do MP roda iframes 0x0/1x1 no
-      // mesmo domínio): NUNCA é um campo PCI — rejeita sem marcar carregando.
-      if (largura < 20 || altura < 15) {
+      // O frame certo tem viewport igual ao elemento iframe do container.
+      // Tolerância 8px (bordas/scroll interno). Iframes ocultos de
+      // antifraude (0x0/1x1) são eliminados aqui automaticamente.
+      if (esperadoW > 0 && esperadoH > 0 &&
+          (Math.abs(largura - esperadoW) > 8 || Math.abs(altura - esperadoH) > 8)) {
         await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {});
         continue;
       }
@@ -977,17 +987,18 @@ async function anexarIframe(cdp, containerId, log = () => {}) {
  * @param {object} cdp         - sessão CDP da página
  * @param {string} containerId - id do div container sem # (ex: 'mp-card-number')
  * @param {string} texto       - valor a digitar (só dígitos usados para PCI)
- * @param {object} [opts]      - media, desvio, pausasBloco, limparAntes
+ * @param {object} [opts]      - media, desvio, pausasBloco
  * @param {Function} log       - função de log
+ * @returns {Promise<boolean>} true SOMENTE quando o readback confirma o
+ *          valor no campo — o caller deve falhar o step se vier false.
  *
- * limparAntes: lê o valor atual do campo via OOPIF antes de digitar.
- * Os campos do MP retêm o valor entre desmontar/remontar — sem isso a
- * re-tokenização do Step 3 digitaria sobre dígitos já presentes.
- * Se o campo já contém o valor esperado, a digitação é pulada.
+ * Sempre lê o valor atual antes de digitar: os campos MP podem reter
+ * valor entre remontagens (Step 3 re-tokeniza os mesmos campos do Step 2).
+ * Igual ao esperado → confirma sem digitar; divergente → limpa e digita.
  */
-async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 50, pausasBloco = false, limparAntes = false } = {}, log = () => {}) {
+async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 50, pausasBloco = false } = {}, log = () => {}) {
   const chars = [...String(texto).replace(/\D/g, '')];
-  if (!chars.length) return;
+  if (!chars.length) return true;
 
   // Clique no container → foca o iframe visualmente (evento trusted).
   const ok = await cdp.clicarSeletor(`#${containerId}`);
@@ -1020,20 +1031,51 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
   await delay(randomInt(400, 800));
 
   log('iframe', `${containerId}: digitando ${chars.length} dígitos`);
+  const esperado = chars.join('');
+
+  /** Lê o valor atual do input dentro do frame anexado. */
+  const lerValor = async (sessao) => {
+    const l = await cdp.send('Runtime.evaluate', {
+      expression: `document.querySelector('input')?.value ?? ''`,
+      returnByValue: true,
+    }, sessao).catch(() => null);
+    return String(l?.result?.value ?? '');
+  };
 
   // --- Caminho principal: sessão OOPIF direta no frame PCI ----------------
-  // Até 2 tentativas: a primeira pode pegar frame ainda carregando ou com
-  // foco interno não estabelecido; re-anexar resolve casos transitórios.
-  for (let tentativa = 0; tentativa < 2; tentativa++) {
+  // Até 3 tentativas completas: anexa → foca → digita → LÊ O VALOR.
+  // O bot só avança quando o readback confirma os dígitos no campo certo.
+  for (let tentativa = 0; tentativa < 3; tentativa++) {
     const sessaoIframe = await anexarIframe(cdp, containerId, log).catch(() => null);
-
     if (!sessaoIframe) {
-      log('iframe', `${containerId}: sessão OOPIF não anexada (tentativa ${tentativa + 1}/2)`);
+      log('iframe', `${containerId}: sessão OOPIF não anexada (tentativa ${tentativa + 1}/3)`);
       continue;
     }
+    log('iframe', `${containerId}: sessão OOPIF anexada (tentativa ${tentativa + 1}/3)`);
 
-    log('iframe', `${containerId}: sessão OOPIF anexada — digitação direta no frame`);
-    // Foca o input dentro do iframe (DOM do frame é acessível pela sessão).
+    // Leitura prévia: campo retido de montagem anterior (Step 3 re-tokeniza
+    // os mesmos campos do Step 2). Igual → pula; divergente → limpa antes.
+    const valorInicial = await lerValor(sessaoIframe);
+    const digitosIniciais = valorInicial.replace(/\D/g, '');
+    if (digitosIniciais === esperado) {
+      log('iframe', `${containerId}: já contém o valor esperado — confirmado sem digitar`);
+      await cdp.send('Target.detachFromTarget', { sessionId: sessaoIframe }).catch(() => {});
+      return true;
+    }
+    if (digitosIniciais.length) {
+      log('iframe', `${containerId}: ${digitosIniciais.length} dígitos divergentes — limpando`);
+      // Ctrl+A + Backspace — eventos trusted na sessão do frame (modifiers 2 = Ctrl).
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 2 }, sessaoIframe);
+      await delay(jitter(70));
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA' }, sessaoIframe);
+      await delay(80);
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace' }, sessaoIframe);
+      await delay(jitter(90));
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace' }, sessaoIframe);
+      await delay(150);
+    }
+
+    // Foca o input dentro do iframe (DOM do frame acessível pela sessão).
     const foco = await cdp.send('Runtime.evaluate', {
       expression: `(() => {
         const i = document.querySelector('input');
@@ -1045,33 +1087,6 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
     }, sessaoIframe);
     log('iframe', `${containerId}: foco interno → ${foco?.result?.value ?? '?'}`);
 
-    // Valor retido de uma montagem anterior (Step 3 re-tokeniza os mesmos
-    // campos do Step 2). Se já bate com o alvo, pula; se diverge, limpa.
-    if (limparAntes) {
-      const atual = await cdp.send('Runtime.evaluate', {
-        expression: `document.querySelector('input')?.value ?? ''`,
-        returnByValue: true,
-      }, sessaoIframe).catch(() => null);
-      const digitosAtuais = String(atual?.result?.value ?? '').replace(/\D/g, '');
-      if (digitosAtuais === chars.join('')) {
-        log('iframe', `${containerId}: já contém o valor esperado — digitação pulada`);
-        await cdp.send('Target.detachFromTarget', { sessionId: sessaoIframe }).catch(() => {});
-        return;
-      }
-      if (digitosAtuais.length) {
-        log('iframe', `${containerId}: campo contém ${digitosAtuais.length} dígitos retidos — limpando`);
-        // Ctrl+A + Backspace — eventos trusted na sessão do frame (modifiers 2 = Ctrl).
-        await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 2 }, sessaoIframe);
-        await delay(jitter(70));
-        await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA' }, sessaoIframe);
-        await delay(80);
-        await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace' }, sessaoIframe);
-        await delay(jitter(90));
-        await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace' }, sessaoIframe);
-        await delay(150);
-      }
-    }
-
     for (let i = 0; i < chars.length; i++) {
       await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: chars[i], text: chars[i] }, sessaoIframe);
       await delay(jitter(85, { pct: 0.25 }));
@@ -1082,28 +1097,23 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
       }
     }
 
-    // VERIFICAÇÃO: lê o valor real do input dentro do iframe.
-    // Compara só dígitos — o MP mascara o campo (espaços a cada 4).
-    const leitura = await cdp.send('Runtime.evaluate', {
-      expression: `document.querySelector('input')?.value ?? ''`,
-      returnByValue: true,
-    }, sessaoIframe).catch(() => null);
-    const valorReal = String(leitura?.result?.value ?? '');
+    // VERIFICAÇÃO: lê o valor real — compara só dígitos (o MP mascara com espaços).
+    const valorReal = await lerValor(sessaoIframe);
     const digitosReais = valorReal.replace(/\D/g, '');
-
-    // Desanexa a sessão do iframe — limpa o estado antes do próximo campo.
     await cdp.send('Target.detachFromTarget', { sessionId: sessaoIframe }).catch(() => {});
 
-    if (digitosReais === chars.join('')) {
+    if (digitosReais === esperado) {
       log('iframe', `${containerId}: ${digitosReais.length} dígitos confirmados no campo`);
-      return;
+      return true;
     }
-    log('iframe', `${containerId}: campo tem "${valorReal.slice(0, 20)}" (${digitosReais.length}/${chars.length}) — ${tentativa === 0 ? 're-anexando' : 'roteamento de foco'}`);
+    log('iframe', `${containerId}: campo tem "${valorReal.slice(0, 20)}" (${digitosReais.length}/${chars.length}) — tentativa ${tentativa + 1}/3`);
+    await delay(500);
   }
 
-  // --- Fallback: teclas na sessão da página (depende do foco no frame) ----
-  // Roteamento de foco é incerto em iframe cross-origin — usado só quando
-  // a sessão OOPIF não abre de jeito nenhum (browser sem suporte a OOPIF).
+  // --- Fallback final: roteamento de foco + verificação OOPIF --------------
+  // As teclas vão pela sessão da página (dependem do foco real no frame),
+  // mas a CONFIRMAÇÃO também é feita lendo o valor — nada passa sem prova.
+  log('iframe', `${containerId}: OOPIF esgotado — fallback de foco com verificação`);
   for (let i = 0; i < chars.length; i++) {
     await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: chars[i], text: chars[i] }, cdp.sessionId);
     await delay(jitter(85, { pct: 0.25 }));
@@ -1113,7 +1123,17 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
       await delay(randomInt(400, 1400));
     }
   }
-  log('iframe', `${containerId}: fallback executado — campo pode estar vazio`);
+  const sessaoFinal = await anexarIframe(cdp, containerId, log).catch(() => null);
+  if (sessaoFinal) {
+    const valorFinal = await lerValor(sessaoFinal);
+    await cdp.send('Target.detachFromTarget', { sessionId: sessaoFinal }).catch(() => {});
+    if (valorFinal.replace(/\D/g, '') === esperado) {
+      log('iframe', `${containerId}: confirmado via fallback (${esperado.length} dígitos)`);
+      return true;
+    }
+  }
+  log('iframe', `${containerId}: FALHOU — campo não confirmou em nenhuma tentativa`);
+  return false;
 }
 
 /**
@@ -1182,9 +1202,10 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
   }
 
   // 1. Número do cartão (iframe PCI — 16 dígitos).
-  await digitarEmIframe(cdp, 'mp-card-number', cartao.numero, {
+  const okNumero = await digitarEmIframe(cdp, 'mp-card-number', cartao.numero, {
     media, desvio, pausasBloco: Boolean(cad.pausas_entre_blocos_4_digitos),
   }, log);
+  if (!okNumero) throw new Error('Número do cartão não confirmado no iframe.');
   await devolverFocoPagina(cdp);
   await delay(randomInt(400, 900));
 
@@ -1200,13 +1221,15 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
   // 3. Validade (iframe PCI — formato MMAA, 4 dígitos).
   // O campo do MP aceita só dígitos — a barra é inserida automaticamente.
   const validadeDigitos = String(cartao.validade ?? '').replace(/\D/g, '').slice(0, 4);
-  await digitarEmIframe(cdp, 'mp-expiration-date', validadeDigitos, { media, desvio }, log);
+  const okValidade = await digitarEmIframe(cdp, 'mp-expiration-date', validadeDigitos, { media, desvio }, log);
+  if (!okValidade) throw new Error('Validade não confirmada no iframe.');
   await devolverFocoPagina(cdp);
   await delay(randomInt(400, 800));
 
   // 4. CVV (iframe PCI — 3 ou 4 dígitos).
   const cvvDigitos = String(cartao.cvv ?? '').replace(/\D/g, '');
-  await digitarEmIframe(cdp, 'mp-security-code', cvvDigitos, { media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio }, log);
+  const okCvv = await digitarEmIframe(cdp, 'mp-security-code', cvvDigitos, { media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio }, log);
+  if (!okCvv) throw new Error('CVV não confirmado no iframe.');
   await devolverFocoPagina(cdp);
   await delay(randomInt(400, 800));
 
@@ -1278,24 +1301,27 @@ async function step3Confirmacao(cdp, step, seletores, cartao, log) {
   // Pausa humana de quem leu a tela antes de digitar.
   await delay(jitter(step.tempo_entre_step2_e_step3_ms ?? 2000));
 
-  // 1. Número do cartão — limparAntes trata valor retido da montagem anterior.
-  await digitarEmIframe(cdp, 'mp-card-number', cartao.numero, {
-    media, desvio, pausasBloco: Boolean(cad.pausas_entre_blocos_4_digitos), limparAntes: true,
+  // 1. Número do cartão — a leitura prévia interna já trata valor retido.
+  const okNumero = await digitarEmIframe(cdp, 'mp-card-number', cartao.numero, {
+    media, desvio, pausasBloco: Boolean(cad.pausas_entre_blocos_4_digitos),
   }, log);
+  if (!okNumero) throw new Error('Step 3: número do cartão não confirmado.');
   await devolverFocoPagina(cdp);
   await delay(randomInt(400, 900));
 
   // 2. Validade (iframe PCI — formato MMAA, só dígitos).
   const validadeDigitos = String(cartao.validade ?? '').replace(/\D/g, '').slice(0, 4);
-  await digitarEmIframe(cdp, 'mp-expiration-date', validadeDigitos, { media, desvio, limparAntes: true }, log);
+  const okValidade = await digitarEmIframe(cdp, 'mp-expiration-date', validadeDigitos, { media, desvio }, log);
+  if (!okValidade) throw new Error('Step 3: validade não confirmada.');
   await devolverFocoPagina(cdp);
   await delay(randomInt(400, 800));
 
   // 3. CVV (iframe PCI — 3 ou 4 dígitos).
   const cvvDigitos = String(cartao.cvv ?? '').replace(/\D/g, '');
-  await digitarEmIframe(cdp, 'mp-security-code', cvvDigitos, {
-    media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio, limparAntes: true,
+  const okCvv = await digitarEmIframe(cdp, 'mp-security-code', cvvDigitos, {
+    media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio,
   }, log);
+  if (!okCvv) throw new Error('Step 3: CVV não confirmado.');
   await devolverFocoPagina(cdp);
   await delay(randomInt(800, 2000));
 
