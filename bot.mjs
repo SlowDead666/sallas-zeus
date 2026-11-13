@@ -1199,14 +1199,31 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
     // VERIFICAÇÃO: lê o valor real — compara só dígitos (o MP mascara com espaços).
     const valorReal = await lerValor(sessaoIframe);
     const digitosReais = valorReal.replace(/\D/g, '');
-    await cdp.send('Target.detachFromTarget', { sessionId: sessaoIframe }).catch(() => {});
 
     if (digitosReais === esperado) {
+      await cdp.send('Target.detachFromTarget', { sessionId: sessaoIframe }).catch(() => {});
       log('iframe', `${containerId}: ${digitosReais.length} dígitos confirmados no campo`);
       return true;
     }
     // Nunca logar o valor lido — pode conter dígitos do cartão.
-    log('iframe', `${containerId}: divergiu — ${digitosReais.length}/${chars.length} dígitos (tentativa ${tentativa + 1}/3)`);
+    // Diagnóstico da divergência (sessão ainda anexada): quantos inputs
+    // o frame tem, qual o seletor escolheu e o tamanho do valor.
+    const diag = await cdp.send('Runtime.evaluate', {
+      expression: `(() => {
+        const ins = [...document.querySelectorAll('input')];
+        const vis = ins.filter(i => i.getClientRects().length);
+        const inp = vis.find(x => /cc-|number|expir|csc|cvv|security|code/i.test([x.name,x.getAttribute('autocomplete')||'',x.placeholder||'',x.id||''].join(' '))) || vis[0] || ins[0];
+        return JSON.stringify({
+          total: ins.length, visiveis: vis.length,
+          alvo: inp ? [inp.name||'', inp.getAttribute('autocomplete')||'', inp.placeholder||'', inp.id||''].join('|') : 'nenhum',
+          valorLen: inp ? String(inp.value||'').length : -1,
+          ativo: document.activeElement === inp,
+        });
+      })()`,
+      returnByValue: true,
+    }, sessaoIframe).catch(() => null);
+    await cdp.send('Target.detachFromTarget', { sessionId: sessaoIframe }).catch(() => {});
+    log('iframe', `${containerId}: divergiu — ${digitosReais.length}/${chars.length} dígitos (tentativa ${tentativa + 1}/3) ${diag?.result?.value ?? ''}`);
     // Respiro de alguns segundos antes da próxima tentativa.
     if (tentativa < 2) await delay(randomInt(1500, 3000));
   }
