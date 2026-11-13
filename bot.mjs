@@ -1179,7 +1179,19 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
       expression: `(() => { ${exprInput} if(!inp) return 'sem-input'; inp.focus(); return document.activeElement===inp?'focado':'nao-focou'; })()`,
       returnByValue: true,
     }, sessaoIframe);
-    log('iframe', `${containerId}: foco interno → ${foco?.result?.value ?? '?'}`);
+    const focoStatus = foco?.result?.value ?? '?';
+    log('iframe', `${containerId}: foco interno → ${focoStatus}`);
+
+    // SEM FOCO = SEM DIGITAÇÃO. Antes o código logava e digitava mesmo
+    // assim — as teclas da sessão da página iam pro campo que tinha foco
+    // antes (ex.: CVV caindo dentro da validade). Melhor falhar a
+    // tentativa do que sujar o campo vizinho.
+    if (focoStatus !== 'focado') {
+      log('iframe', `${containerId}: foco não confirmado — tentativa abortada sem digitar`);
+      await cdp.send('Target.detachFromTarget', { sessionId: sessaoIframe }).catch(() => {});
+      if (tentativa < 2) await delay(randomInt(1500, 3000));
+      continue;
+    }
 
     // Leitura prévia COM foco estabelecido: campo retido de montagem
     // anterior (Step 3 re-tokeniza os mesmos campos do Step 2). Igual →
@@ -1205,9 +1217,25 @@ async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 
       await delay(150);
       // Confirma que esvaziou de verdade — se restou dígito, o campo
       // recusou a limpeza e digitar por cima só pioraria a divergência.
-      const resto = (await lerValor(sessaoIframe)).replace(/\D/g, '');
+      let resto = (await lerValor(sessaoIframe)).replace(/\D/g, '');
+      // Ctrl+A pode ser ignorado por input mascarado do MP — fallback:
+      // martela Backspace (24x cobre o maior campo PCI: 19 dígitos).
       if (resto.length) {
-        log('iframe', `${containerId}: limpeza incompleta — ${resto.length} dígito(s) restante(s)`);
+        log('iframe', `${containerId}: Ctrl+A não esvaziou — martelando Backspace`);
+        for (let b = 0; b < 24 && resto.length; b++) {
+          await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace' }, sessaoTeclas);
+          await delay(jitter(60));
+          await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace' }, sessaoTeclas);
+          await delay(jitter(60));
+          if (b % 6 === 5) resto = (await lerValor(sessaoIframe)).replace(/\D/g, '');
+        }
+        resto = (await lerValor(sessaoIframe)).replace(/\D/g, '');
+        if (resto.length) {
+          log('iframe', `${containerId}: limpeza falhou — ${resto.length} dígito(s) teimoso(s); abortando tentativa`);
+          await cdp.send('Target.detachFromTarget', { sessionId: sessaoIframe }).catch(() => {});
+          if (tentativa < 2) await delay(randomInt(1500, 3000));
+          continue;
+        }
       }
     }
 
