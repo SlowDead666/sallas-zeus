@@ -783,6 +783,12 @@ async function digitarCampoVerificado(cdp, nome, valor, { media = 160, desvio = 
   const sel = `[name="${nome}"]`;
   const q = JSON.stringify(sel);
   const esperado = soDigitos ? String(valor).replace(/\D/g, '') : String(valor);
+  // Valor vazio NÃO é sucesso — '' === '' passaria na verificação com o
+  // campo vazio e o step seguiria sem o dado.
+  if (!esperado) {
+    log('campo', `${nome}: valor vazio — nada a digitar`);
+    return false;
+  }
 
   for (let tentativa = 0; tentativa < 3; tentativa++) {
     const focado = await focarCampo(cdp, nome, log);
@@ -938,9 +944,12 @@ async function anexarIframe(cdp, containerId, log = () => {}) {
     const baseSrc = src.split('?')[0];
 
     // Resolve o frameId do iframe deste container (uma vez — o elemento
-    // não troca de identidade depois de montado).
+    // não troca de identidade depois de montado). DOM.enable é
+    // pré-requisito do describeNode em algumas versões do Chromium —
+    // sem ele o frameId fica null e tudo cai no chute por marcador.
     if (!frameId) {
-      frameId = await cdp.send('DOM.getDocument', { depth: -1 })
+      frameId = await cdp.send('DOM.enable').catch(() => null)
+        .then(() => cdp.send('DOM.getDocument', { depth: -1 }))
         .then(doc => cdp.send('DOM.querySelector', {
           nodeId: doc.root.nodeId, selector: `#${containerId} iframe`,
         }))
@@ -956,25 +965,36 @@ async function anexarIframe(cdp, containerId, log = () => {}) {
       t.url === src || t.url.split('?')[0] === baseSrc || src.startsWith(t.url.split('?')[0])
     ));
 
-    // Caminho determinístico: se o frameId foi resolvido e o OOPIF com
-    // esse targetId existe, é ELE — sem marcador, sem tamanho, sem chute.
+    // Caminho determinístico: se o frameId foi resolvido, SÓ o target
+    // com esse targetId é aceitável. Se ele ainda não comitou, continua
+    // sondando — NUNCA cai no chute por marcador (os campos PCI são
+    // visualmente idênticos e o marcador já anexou o frame errado antes).
+    let aguardandoFrameId = false;
     if (frameId) {
       const exato = candidatos.find(t => t.targetId === frameId);
       if (exato) {
         const { sessionId } = await cdp.send('Target.attachToTarget', {
           targetId: exato.targetId, flatten: true,
         }).catch(() => ({}));
-        if (sessionId) return { sessionId, targetId: exato.targetId };
+        if (sessionId) {
+          if (ciclo > 0) log('iframe', `${containerId}: frameId resolvido → OOPIF anexado (ciclo ${ciclo + 1})`);
+          return { sessionId, targetId: exato.targetId };
+        }
       }
+      // frameId conhecido mas OOPIF ainda não listado = carregando.
+      aguardandoFrameId = true;
     }
 
     // Sem candidatos = OOPIF ainda não comitou o conteúdo do iframe —
     // trata como "carregando" para continuar re-sondando.
-    let carregando = candidatos.length === 0;
+    let carregando = candidatos.length === 0 || aguardandoFrameId;
     if (ciclo === 0 || ciclo % 6 === 0) {
-      log('iframe', `${containerId}: sondagem ${ciclo + 1} — ${candidatos.length} candidato(s) OOPIF`);
+      log('iframe', `${containerId}: sondagem ${ciclo + 1} — ${candidatos.length} candidato(s) OOPIF${frameId ? ' (frameId: aguardando)' : ''}`);
     }
-    for (const t of candidatos) {
+
+    // Loop de marcadores: SOMENTE quando o frameId não resolveu —
+    // com frameId conhecido, anexar por marcador pode pegar o campo errado.
+    if (!frameId) for (const t of candidatos) {
       const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: t.targetId, flatten: true }).catch(() => ({}));
       if (!sessionId) continue;
       const info = await cdp.send('Runtime.evaluate', {
@@ -1057,7 +1077,12 @@ async function anexarIframe(cdp, containerId, log = () => {}) {
  */
 async function digitarEmIframe(cdp, containerId, texto, { media = 180, desvio = 50, pausasBloco = false } = {}, log = () => {}) {
   const chars = [...String(texto).replace(/\D/g, '')];
-  if (!chars.length) return true;
+  // Valor vazio NÃO é sucesso — antes retornava true e o step seguia
+  // com o campo PCI vazio (token falharia no MP sem diagnóstico aqui).
+  if (!chars.length) {
+    log('iframe', `${containerId}: valor vazio — nada a digitar`);
+    return false;
+  }
 
   // Clique no container → foca o iframe visualmente (evento trusted).
   const ok = await cdp.clicarSeletor(`#${containerId}`);
@@ -1334,7 +1359,9 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
   // 2. Nome no cartão (input nosso) — digitação verificada: o popup de
   // autofill do Chrome (dados de cartão/endereço) pode preencher o campo
   // ou engolir teclas; o readback garante o conteúdo real.
-  const nomeHolder = cartao.nome_titular ?? `${comprador.first_name} ${comprador.last_name}`.toUpperCase();
+  const nomeHolder = cartao.nome_titular
+    ?? [comprador.first_name, comprador.last_name].filter(Boolean).join(' ').toUpperCase();
+  if (!nomeHolder.trim()) throw new Error('Nome do titular ausente — cartao.nome_titular e comprador.first_name/last_name vazios.');
   const okHolder = await digitarCampoVerificado(cdp, seletores.campoHolder, nomeHolder, { media, desvio }, log);
   if (!okHolder) throw new Error('Campo nome do titular não confirmou o valor digitado.');
   log('step2', `card_holder digitado (${nomeHolder.length} chars)`);
@@ -1342,7 +1369,10 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
 
   // 3. Validade (iframe PCI — formato MMAA, 4 dígitos).
   // O campo do MP aceita só dígitos — a barra é inserida automaticamente.
-  const validadeDigitos = String(cartao.validade ?? '').replace(/\D/g, '').slice(0, 4);
+  // Aceita MM/AA (4 dígitos) e MM/AAAA (6 dígitos → MM+AA); antes o
+  // slice(0,4) em "12/2030" produzia "1220" — validade errada silenciosa.
+  const valDig2 = String(cartao.validade ?? '').replace(/\D/g, '');
+  const validadeDigitos = valDig2.length >= 6 ? valDig2.slice(0, 2) + valDig2.slice(-2) : valDig2.slice(0, 4);
   const okValidade = await digitarEmIframe(cdp, 'mp-expiration-date', validadeDigitos, { media, desvio }, log);
   if (!okValidade) throw new Error('Validade não confirmada no iframe.');
   await devolverFocoPagina(cdp);
@@ -1358,6 +1388,7 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
   // 5. CPF do titular (input nosso — só dígitos; o campo formata via onInput).
   // soDigitos compara ignorando a máscara 000.000.000-00 aplicada pelo input.
   const cpfDigitos = String(cartao.cpf_titular ?? comprador.cpf ?? '').replace(/\D/g, '');
+  if (!cpfDigitos) throw new Error('CPF do titular ausente — cartao.cpf_titular e comprador.cpf vazios.');
   const okCpf = await digitarCampoVerificado(cdp, seletores.campoCpfTitular, cpfDigitos, { media, desvio, soDigitos: true }, log);
   if (!okCpf) throw new Error('Campo CPF do titular não confirmou o valor digitado.');
   log('step2', `cpf_titular digitado (${cpfDigitos.length} chars)`);
@@ -1435,7 +1466,9 @@ async function step3Confirmacao(cdp, step, seletores, cartao, log) {
   await delay(randomInt(400, 900));
 
   // 2. Validade (iframe PCI — formato MMAA, só dígitos).
-  const validadeDigitos = String(cartao.validade ?? '').replace(/\D/g, '').slice(0, 4);
+  // Aceita MM/AA e MM/AAAA — ver comentário no Step 2.
+  const valDig3 = String(cartao.validade ?? '').replace(/\D/g, '');
+  const validadeDigitos = valDig3.length >= 6 ? valDig3.slice(0, 2) + valDig3.slice(-2) : valDig3.slice(0, 4);
   const okValidade = await digitarEmIframe(cdp, 'mp-expiration-date', validadeDigitos, { media, desvio }, log);
   if (!okValidade) throw new Error('Step 3: validade não confirmada.');
   await devolverFocoPagina(cdp);
@@ -1541,7 +1574,11 @@ export async function executeBot({ endpoint, matriz, comprador = {}, cartao = {}
       // o cartão completo (token de cardId não é aceito no /preapproval).
       // O que distingue os steps é o input card_holder: existe só no Step 2.
       // O DOM decide — o bot nunca presume qual variação ocorreu.
-      await cdp.esperarSeletor(sel.step2CardNumber, 15000);
+      // Se o Step 1 não avançou (API de cliente falhou, validação), o
+      // #mp-card-number nunca aparece — antes o retorno era ignorado e
+      // o bot rodava o Step 3 na página errada com erro confuso.
+      const avancou = await cdp.esperarSeletor(sel.step2CardNumber, 15000);
+      if (!avancou) throw new Error('Checkout não avançou após o Step 1 — #mp-card-number não apareceu.');
       const temHolder = await cdp.evaluate(
         `!!document.querySelector('form input[name="card_holder"]')`
       );
