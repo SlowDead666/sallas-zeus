@@ -235,7 +235,23 @@ export function createNstClient(settings) {
     } catch { throw new AppError(502, 'Não foi possível acessar a API NST. Verifique endereço, cliente aberto e conectividade.'); }
     let result;
     try { result = await response.json(); } catch { throw new AppError(502, 'NST respondeu em formato inválido.'); }
-    if (!response.ok || result.err === true) throw new AppError(502, `NST recusou ${method} ${path.split('?')[0]} (HTTP ${response.status}). Verifique token, créditos e versão.`);
+    if (!response.ok || result.err === true) {
+      // Repassa o detalhe do erro do NST APENAS se for tecnicamente
+      // seguro — o upstream pode ecoar credenciais (URL de proxy com
+      // senha, tokens) na mensagem, e isso vazaria para logs/webhook.
+      // Palavras de segredo ou URLs derrubam o detalhe inteiro.
+      const PERIGOSO = /pass(word)?|token|secret|api[-_]?key|bearer|:\/\/|@|authorization/i;
+      const bruto = typeof result?.message === 'string' && result.message
+        ? result.message
+        : typeof result?.error === 'string' && result.error
+          ? result.error
+          : typeof result?.msg === 'string' && result.msg
+            ? result.msg
+            : null;
+      const detalhe = bruto && !PERIGOSO.test(bruto) ? bruto.replace(/\s+/g, ' ').trim().slice(0, 200) : null;
+      const sufixo = detalhe ? ` Detalhe NST: ${detalhe}` : '';
+      throw new AppError(502, `NST recusou ${method} ${path.split('?')[0]} (HTTP ${response.status}).${sufixo} Verifique token, créditos e versão.`);
+    }
     return result.data;
   };
 }
@@ -340,8 +356,10 @@ export function createProcessor({ clientFactory = createNstClient, navigate = na
       if (input.tipo === 'fechar') {
         if (!existing) throw new AppError(404, 'Perfil não encontrado; nada para fechar.');
         stage = 'fechar navegador';
-        const running = await request('/browsers');
-        if (!Array.isArray(running)) throw new AppError(502, 'Lista de navegadores NST inválida.');
+        // GET /browsers pode retornar null/não-array quando nada está
+        // aberto — trata como lista vazia (mesmo fix do fluxo normal).
+        const runningRaw = await request('/browsers');
+        const running = Array.isArray(runningRaw) ? runningRaw : [];
         if (!running.some(item => item.profileId === id)) return { ok: true, number: input.number, profileId: id, action: 'already_stopped' };
         await request(`/browsers/${encodeURIComponent(id)}`, 'DELETE');
         return { ok: true, number: input.number, profileId: id, action: 'stopped' };
@@ -349,8 +367,9 @@ export function createProcessor({ clientFactory = createNstClient, navigate = na
       if (input.tipo === 'retentativa') {
         if (!existing) throw new AppError(404, 'Perfil de retentativa não encontrado; nenhum perfil foi criado.');
         stage = 'abrir perfil existente';
-        const running = await request('/browsers');
-        if (!Array.isArray(running)) throw new AppError(502, 'Lista de navegadores NST inválida.');
+        // Mesmo fix do fluxo normal: lista vazia do NST não é array.
+        const runningRaw = await request('/browsers');
+        const running = Array.isArray(runningRaw) ? runningRaw : [];
         let runtime = running.find(item => item.profileId === id && item.running);
         if (!runtime) runtime = await request(`/browsers/${encodeURIComponent(id)}`, 'POST');
         if (!runtime?.webSocketDebuggerUrl) runtime = await request(`/browsers/${encodeURIComponent(id)}/debugger`);
