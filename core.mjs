@@ -378,8 +378,10 @@ export function createProcessor({ clientFactory = createNstClient, navigate = na
         await navigate(endpointRet, input.url);
         if (input.bot) {
           // Bot usa o mesmo endpoint CDP da navegação; o perfil retentativa
-          // preserva fingerprint — a sessão do bot herda tudo.
-          agendarBot(input.number, { endpoint: endpointRet, matriz: input.matriz, comprador: input.comprador ?? {}, cartao: input.cartao ?? {}, planoId: input.planoId ?? null }, runBot);
+          // preserva fingerprint — a sessão do bot herda tudo. A url vai
+          // junto para o bot anexar na aba certa (perfil pode ter várias
+          // abas restauradas da sessão anterior).
+          agendarBot(input.number, { endpoint: endpointRet, url: input.url, matriz: input.matriz, comprador: input.comprador ?? {}, cartao: input.cartao ?? {}, planoId: input.planoId ?? null }, runBot);
         }
         return { ok: true, number: input.number, profileId: id, action: 'reused', url: input.url, bot: input.bot ? 'executando' : undefined };
       }
@@ -436,7 +438,8 @@ export function createProcessor({ clientFactory = createNstClient, navigate = na
         }
         if (!endpoint) throw new AppError(502, 'NST não retornou o endereço CDP para o bot.');
         // A startupUrl já abriu /loja — o driver assume a partir daí.
-        agendarBot(input.number, { endpoint, matriz: input.matriz, comprador: input.comprador ?? {}, cartao: input.cartao ?? {}, planoId: input.planoId ?? null }, runBot);
+        // url vai junto: o bot prefere anexar na aba da navegação.
+        agendarBot(input.number, { endpoint, url: input.url, matriz: input.matriz, comprador: input.comprador ?? {}, cartao: input.cartao ?? {}, planoId: input.planoId ?? null }, runBot);
       }
       return { ok: true, number: input.number, profileId: created.profileId, action: existing ? 'recreated' : 'created', url: input.url, warnings, bot: input.bot ? 'executando' : undefined };
     } catch (error) {

@@ -82,7 +82,7 @@ function pick(arr, fallback) {
  * Uso de Target.attachToTarget(flatten) → comandos com sessionId
  * chegam no frame da página, não no browser.
  */
-export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS, onEvent = null } = {}) {
+export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS, onEvent = null, urlAlvo = null } = {}) {
   if (!endpoint || !/^wss?:\/\//.test(endpoint)) {
     throw new Error('Endpoint CDP inválido (webSocketDebuggerUrl esperado).');
   }
@@ -135,19 +135,33 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
     });
   }
 
-  /** Localiza a aba alvo: primeiro target tipo "page" com URL http(s). */
+  /**
+   * Localiza a aba alvo. Com urlAlvo (modo retentativa o perfil pode ter
+   * várias abas restauradas da sessão anterior), prefere a aba cuja URL
+   * bate com a navegação recém-aberta — antes pegava a PRIMEIRA aba http
+   * e o bot rodava numa aba velha/morta (Input.* timeoutava).
+   */
   async function anexar() {
     const { targetInfos } = await send('Target.getTargets');
-    const alvo = targetInfos.find(t => t.type === 'page' && /^https?:/.test(t.url))
-      ?? targetInfos.find(t => t.type === 'page');
+    const paginas = targetInfos.filter(t => t.type === 'page');
+    let alvo = null;
+    if (urlAlvo) {
+      try {
+        const u = new URL(urlAlvo);
+        alvo = paginas.find(t => t.url === urlAlvo)
+          ?? paginas.find(t => t.url.startsWith(urlAlvo))
+          ?? paginas.find(t => { try { return new URL(t.url).origin === u.origin; } catch { return false; } });
+      } catch { /* urlAlvo malformada — cai no fallback abaixo */ }
+    }
+    alvo ??= paginas.find(t => /^https?:/.test(t.url)) ?? paginas[0];
     if (!alvo) throw new Error('Nenhuma aba de página encontrada no navegador.');
     const { sessionId } = await send('Target.attachToTarget', { targetId: alvo.targetId, flatten: true });
     await send('Runtime.enable', {}, sessionId);
     await send('Page.enable', {}, sessionId);
-    return { sessionId, targetId: alvo.targetId };
+    return { sessionId, targetId: alvo.targetId, url: alvo.url };
   }
 
-  const { sessionId } = await anexar();
+  const { sessionId, url: urlAba } = await anexar();
 
   /**
    * Executa JS na página (Runtime.evaluate) e retorna result.value.
@@ -384,6 +398,8 @@ export async function createCdpSession(endpoint, { timeoutMs = TIMEOUT_SESSAO_MS
   const vencimento = Date.now() + timeoutMs;
   return {
     sessionId, ws, evaluate, esperarSeletor, esperarQualquerSeletor,
+    /** URL da aba anexada — diagnóstico de "o bot rodou na aba errada". */
+    urlAba,
     centroDoSeletor,
     clickAt, clicarSeletor, mouseMoverAte, digitar, tecla, teclaEspecial, send,
     rolarPara, alturaRolavel, scrollAtual,
@@ -1559,7 +1575,7 @@ export const SELETORES_PADRAO = {
  * @param {(etapa:string,msg:string)=>void} [args.log]
  * @returns {Promise<{ok:true, etapas:string[]}>}
  */
-export async function executeBot({ endpoint, matriz, comprador = {}, cartao = {}, seletores = {}, planoId = null, log = () => {} }) {
+export async function executeBot({ endpoint, matriz, comprador = {}, cartao = {}, seletores = {}, planoId = null, url = null, log = () => {} }) {
   if (!matriz?.jornada?.etapas?.length) throw new Error('matriz sem jornada.etapas — template ausente.');
   const sel = { ...SELETORES_PADRAO, ...seletores };
   const etapas = matriz.jornada.etapas;
@@ -1582,7 +1598,8 @@ export async function executeBot({ endpoint, matriz, comprador = {}, cartao = {}
     }
   };
 
-  const cdp = await createCdpSession(endpoint, { onEvent });
+  const cdp = await createCdpSession(endpoint, { onEvent, urlAlvo: url });
+  log('bot', `aba anexada: ${cdp.urlAba ?? '?'}`);
   try {
     // Liga captura de logs da página na sessão da aba.
     try { await cdp.send('Log.enable', {}, cdp.sessionId); } catch { /* tolerante */ }
