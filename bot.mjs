@@ -1482,21 +1482,28 @@ async function step3Confirmacao(cdp, step, seletores, cartao, log) {
   const media = jitter(cad.inter_key_interval_ms_medio ?? 190);
   const desvio = jitter(cad.inter_key_interval_ms_desvio ?? 50) || 45;
 
-  // Aguarda o iframe do número montar dentro de #mp-card-number
-  // (o SDK remonta os 3 campos ao entrar no Step 3).
-  log('step3', 'aguardando iframe montar em #mp-card-number');
-  let iframePronto = false;
-  for (let i = 0; i < 30; i++) {
-    const temIframe = await cdp.evaluate(`(() => {
-      const f = document.querySelector('#mp-card-number iframe');
-      if (!f) return false;
-      const r = f.getBoundingClientRect();
-      return r.width > 0 && r.height > 0;
+  // Aguarda o sinal data-mp-tunnel-pronto="true" no form do Step 3.
+  // O checkout expõe esse atributo SOMENTE quando todos os 3 campos PCI
+  // dispararam o evento 'ready' — prova que o túnel do MP conectou.
+  // Verificar apenas a presença do iframe no DOM é insuficiente: o iframe
+  // renderiza visualmente mesmo com ERP_TUNNEL_CONNECTION_FAILED (túnel
+  // morto, campos não clicáveis). Aguardamos até 60s — o watchdog do
+  // checkout tentará remontagem e reinit nesse intervalo.
+  log('step3', 'aguardando data-mp-tunnel-pronto="true" (túnel PCI)');
+  let tunnelPronto = false;
+  for (let i = 0; i < 150; i++) {
+    const pronto = await cdp.evaluate(`(() => {
+      const form = document.querySelector('form[data-mp-tunnel-pronto="true"]');
+      return !!form;
     })()`);
-    if (temIframe) { iframePronto = true; log('step3', `iframe pronto (${i * 400}ms)`); break; }
+    if (pronto) { tunnelPronto = true; log('step3', `túnel PCI pronto (${i * 400}ms)`); break; }
+    if (i % 10 === 0 && i > 0) log('step3', `aguardando túnel PCI... (${(i * 400 / 1000).toFixed(0)}s)`);
     await delay(400);
   }
-  if (!iframePronto) log('step3', 'iframe não confirmado — tentando mesmo assim');
+  if (!tunnelPronto) {
+    log('step3', 'AVISO: túnel PCI não confirmado após 60s — ERP_TUNNEL_CONNECTION_FAILED provável. Abortando step3.');
+    throw new Error('Step 3: túnel PCI do MP não conectou (data-mp-tunnel-pronto não apareceu). Verifique abas antigas do checkout no perfil NST.');
+  }
 
   // Pausa humana de quem leu a tela antes de digitar.
   await delay(jitter(step.tempo_entre_step2_e_step3_ms ?? 2000));

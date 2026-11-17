@@ -276,6 +276,59 @@ export async function findProfile(request, name) {
   return matches[0];
 }
 
+/**
+ * Fecha abas existentes que tenham URLs do mesmo domínio do checkout.
+ * Necessário em retentativa: o perfil tem restoreLastSession=true e pode
+ * ter abas antigas de /checkout abertas com instâncias MP ativas. Múltiplas
+ * instâncias MP do mesmo device fingerprint fazem o backend do MP recusar
+ * novas conexões PCI → ERP_TUNNEL_CONNECTION_FAILED de forma intermitente
+ * (pior após vários runs; recarregar a página não resolve pois as outras
+ * abas continuam abertas).
+ *
+ * @param {string} endpoint  - WebSocket debugger URL do NST
+ * @param {string} targetUrl - URL que será aberta; derivamos o origin dela
+ */
+export async function fecharAbasCheckout(endpoint, targetUrl) {
+  if (!endpoint || !/^wss?:\/\//.test(endpoint)) return;
+  let origin;
+  try { origin = new URL(targetUrl).origin; } catch { return; }
+  await new Promise(resolve => {
+    const ws = new WebSocket(endpoint);
+    let settled = false;
+    const finish = () => { if (!settled) { settled = true; ws.close(); resolve(); } };
+    const timeout = setTimeout(finish, 10000);
+    const pending = new Map(); // id → resolve
+    let nextId = 100;
+    const send = (method, params) => new Promise(res => {
+      const id = nextId++;
+      pending.set(id, res);
+      ws.send(JSON.stringify({ id, method, params: params ?? {} }));
+    });
+    ws.addEventListener('message', ev => {
+      let d; try { d = JSON.parse(ev.data); } catch { return; }
+      if (d.id && pending.has(d.id)) { const res = pending.get(d.id); pending.delete(d.id); res(d.result ?? {}); }
+    });
+    ws.addEventListener('error', finish, { once: true });
+    ws.addEventListener('close', finish, { once: true });
+    ws.addEventListener('open', async () => {
+      try {
+        const { targetInfos } = await send('Target.getTargets');
+        const antigas = (targetInfos ?? []).filter(t =>
+          t.type === 'page' && (() => {
+            try { return new URL(t.url).origin === origin; } catch { return false; }
+          })()
+        );
+        for (const t of antigas) {
+          await send('Target.closeTarget', { targetId: t.targetId }).catch(() => {});
+          console.log(`[fecharAbas] fechada aba antiga: ${t.url}`);
+        }
+      } catch { /* best-effort */ }
+      clearTimeout(timeout);
+      finish();
+    });
+  });
+}
+
 /** Cria uma aba via CDP sem fechar o navegador nem alterar cookies/fingerprint do perfil. */
 export async function navigateCdp(endpoint, url) {
   if (!endpoint || !/^wss?:\/\//.test(endpoint)) throw new AppError(502, 'NST não retornou o endereço CDP.');
@@ -373,8 +426,14 @@ export function createProcessor({ clientFactory = createNstClient, navigate = na
         let runtime = running.find(item => item.profileId === id && item.running);
         if (!runtime) runtime = await request(`/browsers/${encodeURIComponent(id)}`, 'POST');
         if (!runtime?.webSocketDebuggerUrl) runtime = await request(`/browsers/${encodeURIComponent(id)}/debugger`);
-        stage = 'abrir URL no perfil existente';
+        stage = 'fechar abas antigas do checkout';
         const endpointRet = typeof runtime === 'string' ? runtime : runtime?.webSocketDebuggerUrl;
+        // Fecha abas antigas do mesmo domínio antes de abrir a nova — evita
+        // que instâncias MP de sessões anteriores (restauradas via
+        // restoreLastSession) concorram com a nova e causem
+        // ERP_TUNNEL_CONNECTION_FAILED no backend PCI do MP.
+        await fecharAbasCheckout(endpointRet, input.url).catch(() => {});
+        stage = 'abrir URL no perfil existente';
         await navigate(endpointRet, input.url);
         if (input.bot) {
           // Bot usa o mesmo endpoint CDP da navegação; o perfil retentativa
