@@ -1392,12 +1392,40 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
     if (i === 59) log('step2', 'SDK não habilitou botão em 30s — tentando mesmo assim');
   }
 
-  // 1. Número do cartão (iframe PCI — 16 dígitos).
-  const okNumero = await digitarEmIframe(cdp, 'mp-card-number', cartao.numero, {
-    media, desvio, pausasBloco: Boolean(cad.pausas_entre_blocos_4_digitos),
-  }, log);
-  if (!okNumero) throw new Error('Número do cartão não confirmado no iframe.');
-  await devolverFocoPagina(cdp);
+  // Detecta o modo dos campos de cartão:
+  // - 'iframe':   form[data-mp-tunnel-pronto] sem data-mp-fallback — túnel
+  //               PCI conectou (evento 'ready' nos 3 campos).
+  // - 'fallback': form[data-mp-fallback] — o checkout degradou para inputs
+  //               normais porque o túnel PCI não conectou neste ambiente.
+  // Aguarda até 150s — o watchdog do checkout tenta remontagem e reinit
+  // completo do SDK antes de degradar (~100s no pior caso).
+  log('step2', 'aguardando modo dos campos (iframe PCI ou fallback)');
+  let modoCampos = null;
+  for (let i = 0; i < 300 && !modoCampos; i++) {
+    modoCampos = await cdp.evaluate(`(() => {
+      if (document.querySelector('form[data-mp-fallback="true"]')) return 'fallback';
+      if (document.querySelector('form[data-mp-tunnel-pronto="true"]')) return 'iframe';
+      return null;
+    })()`);
+    if (!modoCampos) await delay(500);
+    if (!modoCampos && i % 20 === 19) log('step2', `aguardando modo dos campos... (${(i * 500 / 1000).toFixed(0)}s)`);
+  }
+  if (!modoCampos) throw new Error('Step 2: túnel PCI não conectou e modo fallback não ativou em 150s.');
+  log('step2', `modo dos campos: ${modoCampos}`);
+
+  // 1. Número do cartão — iframe PCI (normal) ou input comum (fallback).
+  let okNumero;
+  if (modoCampos === 'fallback') {
+    const numeroDigitos = String(cartao.numero ?? '').replace(/\D/g, '');
+    okNumero = await digitarCampoVerificado(cdp, 'card_number', numeroDigitos, { media, desvio, soDigitos: true }, log);
+    if (!okNumero) throw new Error('Número do cartão não confirmado no input (fallback).');
+  } else {
+    okNumero = await digitarEmIframe(cdp, 'mp-card-number', cartao.numero, {
+      media, desvio, pausasBloco: Boolean(cad.pausas_entre_blocos_4_digitos),
+    }, log);
+    if (!okNumero) throw new Error('Número do cartão não confirmado no iframe.');
+    await devolverFocoPagina(cdp);
+  }
   await delay(randomInt(400, 900));
 
   // 2. Nome no cartão (input nosso) — digitação verificada: o popup de
@@ -1417,16 +1445,29 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
   // slice(0,4) em "12/2030" produzia "1220" — validade errada silenciosa.
   const valDig2 = String(cartao.validade ?? '').replace(/\D/g, '');
   const validadeDigitos = valDig2.length >= 6 ? valDig2.slice(0, 2) + valDig2.slice(-2) : valDig2.slice(0, 4);
-  const okValidade = await digitarEmIframe(cdp, 'mp-expiration-date', validadeDigitos, { media, desvio }, log);
-  if (!okValidade) throw new Error('Validade não confirmada no iframe.');
-  await devolverFocoPagina(cdp);
+  let okValidade;
+  if (modoCampos === 'fallback') {
+    // input[name="card_exp"] — máscara MM/AA aplicada pelo onInput; digita só dígitos.
+    okValidade = await digitarCampoVerificado(cdp, 'card_exp', validadeDigitos, { media, desvio, soDigitos: true }, log);
+    if (!okValidade) throw new Error('Validade não confirmada no input (fallback).');
+  } else {
+    okValidade = await digitarEmIframe(cdp, 'mp-expiration-date', validadeDigitos, { media, desvio }, log);
+    if (!okValidade) throw new Error('Validade não confirmada no iframe.');
+    await devolverFocoPagina(cdp);
+  }
   await delay(randomInt(400, 800));
 
-  // 4. CVV (iframe PCI — 3 ou 4 dígitos).
+  // 4. CVV (iframe PCI — 3 ou 4 dígitos; input normal no fallback).
   const cvvDigitos = String(cartao.cvv ?? '').replace(/\D/g, '');
-  const okCvv = await digitarEmIframe(cdp, 'mp-security-code', cvvDigitos, { media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio }, log);
-  if (!okCvv) throw new Error('CVV não confirmado no iframe.');
-  await devolverFocoPagina(cdp);
+  let okCvv;
+  if (modoCampos === 'fallback') {
+    okCvv = await digitarCampoVerificado(cdp, 'card_cvv', cvvDigitos, { media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio, soDigitos: true }, log);
+    if (!okCvv) throw new Error('CVV não confirmado no input (fallback).');
+  } else {
+    okCvv = await digitarEmIframe(cdp, 'mp-security-code', cvvDigitos, { media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio }, log);
+    if (!okCvv) throw new Error('CVV não confirmado no iframe.');
+    await devolverFocoPagina(cdp);
+  }
   await delay(randomInt(400, 800));
 
   // 5. CPF do titular (input nosso — só dígitos; o campo formata via onInput).
@@ -1447,8 +1488,10 @@ async function step2Cartao(cdp, step, seletores, comprador, cartao, log) {
   // o distingue do Step 2 é a AUSÊNCIA do input card_holder no form.
   log('step2', 'submit confirmado → aguardando Step 3');
   for (let i = 0; i < 50; i++) {
+    // Step 3 re-renderiza o campo de número: #mp-card-number (iframe) ou
+    // input[name="card_number"] (modo fallback — túnel irrecuperável).
     const noStep3 = await cdp.evaluate(`(() =>
-      !!document.querySelector('#mp-card-number') &&
+      !!document.querySelector('#mp-card-number, form input[name="card_number"]') &&
       !document.querySelector('form input[name="card_holder"]')
     )()`);
     if (noStep3) break;
@@ -1489,50 +1532,79 @@ async function step3Confirmacao(cdp, step, seletores, cartao, log) {
   // renderiza visualmente mesmo com ERP_TUNNEL_CONNECTION_FAILED (túnel
   // morto, campos não clicáveis). Aguardamos até 60s — o watchdog do
   // checkout tentará remontagem e reinit nesse intervalo.
-  log('step3', 'aguardando data-mp-tunnel-pronto="true" (túnel PCI)');
-  let tunnelPronto = false;
-  for (let i = 0; i < 150; i++) {
-    const pronto = await cdp.evaluate(`(() => {
-      const form = document.querySelector('form[data-mp-tunnel-pronto="true"]');
-      return !!form;
+  log('step3', 'aguardando data-mp-tunnel-pronto="true" (túnel PCI) ou modo fallback');
+  // Aguarda até 150s por um dos dois modos:
+  // - 'iframe':   data-mp-tunnel-pronto="true" — túnel PCI conectou.
+  // - 'fallback': data-mp-fallback="true" — checkout degradou para inputs
+  //               normais (túnel irrecuperável neste ambiente).
+  // O watchdog do checkout pode levar ~100s até degradar (remontagem +
+  // até 2 reinit do SDK) — 150s cobre o pior caso.
+  let modoCampos = null;
+  for (let i = 0; i < 375 && !modoCampos; i++) {
+    modoCampos = await cdp.evaluate(`(() => {
+      if (document.querySelector('form[data-mp-fallback="true"]')) return 'fallback';
+      if (document.querySelector('form[data-mp-tunnel-pronto="true"]')) return 'iframe';
+      return null;
     })()`);
-    if (pronto) { tunnelPronto = true; log('step3', `túnel PCI pronto (${i * 400}ms)`); break; }
-    if (i % 10 === 0 && i > 0) log('step3', `aguardando túnel PCI... (${(i * 400 / 1000).toFixed(0)}s)`);
+    if (modoCampos) { log('step3', `modo dos campos: ${modoCampos} (${i * 400}ms)`); break; }
+    if (i % 10 === 0 && i > 0) log('step3', `aguardando túnel PCI ou fallback... (${(i * 400 / 1000).toFixed(0)}s)`);
     await delay(400);
   }
-  if (!tunnelPronto) {
-    log('step3', 'AVISO: túnel PCI não confirmado após 60s — ERP_TUNNEL_CONNECTION_FAILED provável. Abortando step3.');
-    throw new Error('Step 3: túnel PCI do MP não conectou (data-mp-tunnel-pronto não apareceu). Verifique abas antigas do checkout no perfil NST.');
+  if (!modoCampos) {
+    log('step3', 'AVISO: túnel PCI não confirmado e fallback não ativou após 150s — abortando step3.');
+    throw new Error('Step 3: túnel PCI do MP não conectou e modo fallback não ativou. Verifique abas antigas do checkout no perfil NST.');
   }
 
   // Pausa humana de quem leu a tela antes de digitar.
   await delay(jitter(step.tempo_entre_step2_e_step3_ms ?? 2000));
 
-  // 1. Número do cartão — a leitura prévia interna já trata valor retido.
-  const okNumero = await digitarEmIframe(cdp, 'mp-card-number', cartao.numero, {
-    media, desvio, pausasBloco: Boolean(cad.pausas_entre_blocos_4_digitos),
-  }, log);
-  if (!okNumero) throw new Error('Step 3: número do cartão não confirmado.');
-  await devolverFocoPagina(cdp);
-  await delay(randomInt(400, 900));
-
-  // 2. Validade (iframe PCI — formato MMAA, só dígitos).
-  // Aceita MM/AA e MM/AAAA — ver comentário no Step 2.
   const valDig3 = String(cartao.validade ?? '').replace(/\D/g, '');
   const validadeDigitos = valDig3.length >= 6 ? valDig3.slice(0, 2) + valDig3.slice(-2) : valDig3.slice(0, 4);
-  const okValidade = await digitarEmIframe(cdp, 'mp-expiration-date', validadeDigitos, { media, desvio }, log);
-  if (!okValidade) throw new Error('Step 3: validade não confirmada.');
-  await devolverFocoPagina(cdp);
-  await delay(randomInt(400, 800));
-
-  // 3. CVV (iframe PCI — 3 ou 4 dígitos).
   const cvvDigitos = String(cartao.cvv ?? '').replace(/\D/g, '');
-  const okCvv = await digitarEmIframe(cdp, 'mp-security-code', cvvDigitos, {
-    media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio,
-  }, log);
-  if (!okCvv) throw new Error('Step 3: CVV não confirmado.');
-  await devolverFocoPagina(cdp);
-  await delay(randomInt(800, 2000));
+
+  if (modoCampos === 'fallback') {
+    // Modo fallback: inputs normais — mesma digitação verificada dos demais
+    // campos do formulário (sem OOPIF, sem iframe).
+    const numeroDigitos = String(cartao.numero ?? '').replace(/\D/g, '');
+    const okNumero = await digitarCampoVerificado(cdp, 'card_number', numeroDigitos, {
+      media, desvio, soDigitos: true,
+    }, log);
+    if (!okNumero) throw new Error('Step 3: número do cartão não confirmado (fallback).');
+    await delay(randomInt(400, 900));
+
+    const okValidade = await digitarCampoVerificado(cdp, 'card_exp', validadeDigitos, { media, desvio, soDigitos: true }, log);
+    if (!okValidade) throw new Error('Step 3: validade não confirmada (fallback).');
+    await delay(randomInt(400, 800));
+
+    const okCvv = await digitarCampoVerificado(cdp, 'card_cvv', cvvDigitos, {
+      media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio, soDigitos: true,
+    }, log);
+    if (!okCvv) throw new Error('Step 3: CVV não confirmado (fallback).');
+    await delay(randomInt(800, 2000));
+  } else {
+    // 1. Número do cartão — a leitura prévia interna já trata valor retido.
+    const okNumero = await digitarEmIframe(cdp, 'mp-card-number', cartao.numero, {
+      media, desvio, pausasBloco: Boolean(cad.pausas_entre_blocos_4_digitos),
+    }, log);
+    if (!okNumero) throw new Error('Step 3: número do cartão não confirmado.');
+    await devolverFocoPagina(cdp);
+    await delay(randomInt(400, 900));
+
+    // 2. Validade (iframe PCI — formato MMAA, só dígitos).
+    // Aceita MM/AA e MM/AAAA — ver comentário no Step 2.
+    const okValidade = await digitarEmIframe(cdp, 'mp-expiration-date', validadeDigitos, { media, desvio }, log);
+    if (!okValidade) throw new Error('Step 3: validade não confirmada.');
+    await devolverFocoPagina(cdp);
+    await delay(randomInt(400, 800));
+
+    // 3. CVV (iframe PCI — 3 ou 4 dígitos).
+    const okCvv = await digitarEmIframe(cdp, 'mp-security-code', cvvDigitos, {
+      media: jitter(cadCvv.inter_key_interval_ms_medio ?? 180), desvio,
+    }, log);
+    if (!okCvv) throw new Error('Step 3: CVV não confirmado.');
+    await devolverFocoPagina(cdp);
+    await delay(randomInt(800, 2000));
+  }
 
   // Submit — clicarSubmit faz hit-test (elementFromPoint), tenta pontos
   // alternativos fora do PainelSessao e confirma disabled/navegação.
@@ -1629,8 +1701,12 @@ export async function executeBot({ endpoint, matriz, comprador = {}, cartao = {}
       // Se o Step 1 não avançou (API de cliente falhou, validação), o
       // #mp-card-number nunca aparece — antes o retorno era ignorado e
       // o bot rodava o Step 3 na página errada com erro confuso.
-      const avancou = await cdp.esperarSeletor(sel.step2CardNumber, 15000);
-      if (!avancou) throw new Error('Checkout não avançou após o Step 1 — #mp-card-number não apareceu.');
+      // Aceita #mp-card-number (iframe PCI) OU input[name="card_number"]
+      // (modo fallback — túnel irrecuperável, checkout usa inputs normais).
+      const avancou = await cdp.esperarQualquerSeletor(
+        [sel.step2CardNumber, 'form input[name="card_number"]'], 15000
+      );
+      if (!avancou) throw new Error('Checkout não avançou após o Step 1 — nenhum campo de cartão apareceu.');
       const temHolder = await cdp.evaluate(
         `!!document.querySelector('form input[name="card_holder"]')`
       );

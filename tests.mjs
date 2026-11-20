@@ -323,19 +323,35 @@ test('cliente NST envia x-api-key e sanitiza mensagens de erro do upstream', asy
   } finally { await new Promise(resolve => server.close(resolve)); }
 });
 
-test('CDP abre aba e desconecta sem comando Browser.close', async () => {
+test('CDP abre aba, ativa e desconecta sem comando Browser.close', async () => {
   const original = globalThis.WebSocket;
   const sent = [];
-  /** WebSocket sintético reproduz somente a confirmação CDP da aba criada. */
+  /** WebSocket sintético respondendo por id conforme a sequência CDP real. */
   class FakeSocket extends EventTarget {
     constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event('open'))); }
-    send(data) { sent.push(JSON.parse(data)); queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data: '{"id":1,"result":{"targetId":"page"}}' }))); }
+    send(data) {
+      const msg = JSON.parse(data);
+      sent.push(msg);
+      const replies = {
+        1: { id: 1, result: { targetId: 'page' } },
+        2: { id: 2, result: {} },
+      };
+      const reply = replies[msg.id] ?? { id: msg.id, result: {} };
+      queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(reply) })));
+    }
     close() { queueMicrotask(() => this.dispatchEvent(new Event('close'))); }
   }
   globalThis.WebSocket = FakeSocket;
   try { await navigateCdp('ws://mock/browser', payload.url); }
   finally { globalThis.WebSocket = original; }
-  assert.deepEqual(sent, [{ id: 1, method: 'Target.createTarget', params: { url: payload.url } }]);
+  // createTarget → activateTarget. Comandos Browser.* (janela) foram
+  // removidos: o endpoint CDP do NST valida estritamente e pode rejeitar
+  // métodos fora do domínio Target. Janela minimizada é coberta pelo gate
+  // de visibilidade do checkout, que avisa o usuário na página.
+  assert.deepEqual(sent, [
+    { id: 1, method: 'Target.createTarget', params: { url: payload.url } },
+    { id: 2, method: 'Target.activateTarget', params: { targetId: 'page' } },
+  ]);
 });
 
 // ---------------------------------------------------------------------------

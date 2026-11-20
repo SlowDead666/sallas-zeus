@@ -329,7 +329,19 @@ export async function fecharAbasCheckout(endpoint, targetUrl) {
   });
 }
 
-/** Cria uma aba via CDP sem fechar o navegador nem alterar cookies/fingerprint do perfil. */
+/**
+ * Cria uma aba via CDP sem fechar o navegador nem alterar cookies/fingerprint do perfil.
+ *
+ * Após o Target.createTarget, ATIVA a aba explicitamente: no fluxo
+ * `retentativa` o perfil abre com restoreLastSession — as abas restauradas
+ * seguram o foco da janela e a nova aba do checkout pode nascer em
+ * BACKGROUND. Em background o browser throttle timers/rAF agressivamente
+ * (Chrome clamp de 1s+ por timer e occlusion tracking em janela oculta),
+ * e o handshake postMessage interno do iframe PCI do Mercado Pago estoura
+ * o timeout → ERP_TUNNEL_CONNECTION_FAILED intermitente que nem refresh
+ * resolve (a aba segue em background). Ativar a aba garante timers
+ * normais e o handshake completo.
+ */
 export async function navigateCdp(endpoint, url) {
   if (!endpoint || !/^wss?:\/\//.test(endpoint)) throw new AppError(502, 'NST não retornou o endereço CDP.');
   await new Promise((resolve, reject) => {
@@ -344,11 +356,34 @@ export async function navigateCdp(endpoint, url) {
       ws.close();
       error ? reject(error) : resolve();
     }
+    // NOTA: o endpoint CDP do NST valida params estritamente — não enviar
+    // `background` (rejeitado → "CDP recusou a abertura da URL"). O default
+    // do createTarget já é foreground; a ativação vem do activateTarget.
     ws.addEventListener('open', () => ws.send(JSON.stringify({ id: 1, method: 'Target.createTarget', params: { url } })));
+    let targetId = null;
     ws.addEventListener('message', event => {
       let data;
       try { data = JSON.parse(event.data); } catch { return; }
-      if (data.id === 1) finish(data.error ? new AppError(502, 'CDP recusou a abertura da URL.') : undefined);
+      // Guarda: processa a resposta do createTarget UMA vez — eventos id:1
+      // duplicados/echo não podem rearmar os comandos de ativação.
+      if (data.id === 1 && !targetId) {
+        if (data.error) return finish(new AppError(502, 'CDP recusou a abertura da URL.'));
+        targetId = data.result?.targetId;
+        if (!targetId) return finish();
+        // Traz a aba para o primeiro plano — sem isso a aba pode ficar em
+        // background atrás das abas restauradas (ver docstring da função).
+        // Só comandos do domínio Target são usados: o endpoint CDP do NST é
+        // validado estritamente e Browser.* (getWindowForTarget/setWindowBounds)
+        // pode ser rejeitado. Janela minimizada é coberta pelo gate de
+        // visibilidade do checkout, que avisa o usuário na própria página.
+        ws.send(JSON.stringify({ id: 2, method: 'Target.activateTarget', params: { targetId } }));
+        return;
+      }
+      if (data.id === 2) {
+        // Falha na ativação não é fatal — segue o fluxo; o importante era a
+        // tentativa. Log implícito: se o túnel falhar, a causa era outra.
+        finish();
+      }
     });
     ws.addEventListener('error', () => finish(new AppError(502, 'Falha na conexão CDP do navegador.')), { once: true });
     ws.addEventListener('close', () => finish(new AppError(502, 'CDP desconectou antes da confirmação.')), { once: true });
